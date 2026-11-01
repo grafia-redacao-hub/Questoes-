@@ -1,5 +1,5 @@
 const DB_NAME = 'grafia-questoes-db';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 function requestPromise(request) {
   return new Promise((resolve, reject) => {
@@ -18,9 +18,10 @@ function transactionDone(tx) {
 
 export async function openDB() {
   const request = indexedDB.open(DB_NAME, DB_VERSION);
-  request.onupgradeneeded = () => {
+  request.onupgradeneeded = event => {
     const db = request.result;
-    const ensure = (name, options) => db.objectStoreNames.contains(name) ? request.transaction.objectStore(name) : db.createObjectStore(name, options);
+    const upgradeTx = event.target.transaction;
+    const ensure = (name, options) => db.objectStoreNames.contains(name) ? upgradeTx.objectStore(name) : db.createObjectStore(name, options);
     const questions = ensure('questions', { keyPath: 'id' });
     if (!questions.indexNames.contains('area')) questions.createIndex('area', 'area', { unique: false });
     if (!questions.indexNames.contains('subject')) questions.createIndex('subject', 'subject', { unique: false });
@@ -31,14 +32,14 @@ export async function openDB() {
     const assets = ensure('assets', { keyPath: 'id' });
     if (!assets.indexNames.contains('fileName')) assets.createIndex('fileName', 'fileName', { unique: false });
     const assetBlobs = ensure('assetBlobs', { keyPath: 'id' });
-    if (request.oldVersion < 2) {
+    if (event.oldVersion < 3) {
       const cursorRequest = assets.openCursor();
       cursorRequest.onsuccess = () => {
         const cursor = cursorRequest.result;
         if (!cursor) return;
         const value = cursor.value;
         if (value && value.blob) {
-          assetBlobs.put({ id: value.id, blob: value.blob });
+          assetBlobs.put({ id: value.id, blob: value.blob, type: value.mimeType || value.blob.type || '', updatedAt: value.updatedAt || new Date().toISOString() });
           delete value.blob;
           cursor.update(value);
         }
@@ -76,7 +77,7 @@ async function ensureInitialSettings(db) {
     if (!currentReq.result) store.put({ key: 'databaseId', value: crypto.randomUUID() });
     const versionReq = store.get('appVersion');
     versionReq.onsuccess = () => {
-      if (!versionReq.result) store.put({ key: 'appVersion', value: '1.0.0' });
+      if (versionReq.result?.value !== '1.0.1') store.put({ key: 'appVersion', value: '1.0.1' });
     };
   };
   await done;

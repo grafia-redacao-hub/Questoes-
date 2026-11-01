@@ -157,13 +157,12 @@ function findAssetFile(files, ref) {
   if (requested && files.has(requested)) return files.get(requested);
   const basename = requested.split('/').pop();
   if (basename) {
-    for (const [path, blob] of files) if (path.split('/').pop() === basename) return blob;
+    const matches = [...files.entries()].filter(([path]) => path.split('/').pop() === basename);
+    if (matches.length === 1) return matches[0][1];
+    if (matches.length > 1) return null;
   }
-  for (const [path, blob] of files) {
-    const name = path.split('/').pop();
-    if (name.startsWith(`${ref.assetId}.`)) return blob;
-  }
-  return null;
+  const idMatches = [...files.entries()].filter(([path]) => path.split('/').pop().startsWith(`${ref.assetId}.`));
+  return idMatches.length === 1 ? idMatches[0][1] : null;
 }
 
 export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
@@ -219,7 +218,15 @@ export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
   if (textBases.some(item => !item.id || !item.content)) throw new Error('Há um texto-base sem identificador ou conteúdo.');
   if (textBaseIds.size !== textBases.length) throw new Error('Há identificadores repetidos na lista de textos-base do pacote.');
   const existingTextBases = await getAll(db, 'textBases');
+  const existingTextBaseMap = new Map(existingTextBases.map(item => [item.id, item]));
+  for (const item of textBases) {
+    const existing = existingTextBaseMap.get(item.id);
+    if (existing && (normalizeSearch(existing.content) !== normalizeSearch(item.content) || normalizeSearch(existing.title) !== normalizeSearch(item.title))) {
+      throw new Error(`O texto-base ${item.id} já existe com conteúdo diferente. Use outro ID ou resolva o conflito antes de importar, para evitar sobrescrever o texto existente.`);
+    }
+  }
   for (const item of existingTextBases) textBaseIds.add(item.id);
+  const textBasesToWrite = textBases.filter(item => !existingTextBaseMap.has(item.id));
 
   let zipFiles = new Map();
   if (zipFile) zipFiles = await readZip(zipFile);
@@ -280,7 +287,7 @@ export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
     packageId: str(pkg.packageId ?? pkg.package_id) || crypto.randomUUID(),
     packageName: str(pkg.packageName ?? pkg.name ?? pkg.nome) || jsonFile.name,
     schemaVersion: String(pkg.schemaVersion),
-    questions, textBases, assets, assetBlobs, incomplete, duplicates, sourceExam,
+    questions, textBases: textBasesToWrite, assets, assetBlobs, incomplete, duplicates, sourceExam,
     filesFound: zipFiles.size,
     invalidAssetIds: [...invalidAssetIds],
     fileName: jsonFile.name,
@@ -299,7 +306,16 @@ export function mergeQuestion(existing, incoming) {
   for (const [key, value] of Object.entries(incoming.alternatives || {})) if (!merged.alternatives[key]) merged.alternatives[key] = value;
   merged.alternativeExplanations = { ...(existing.alternativeExplanations || {}) };
   for (const [key, value] of Object.entries(incoming.alternativeExplanations || {})) if (!merged.alternativeExplanations[key]) merged.alternativeExplanations[key] = value;
-  const imageMap = new Map([...(existing.images || []), ...(incoming.images || [])].map(image => [image.assetId, image]));
+  const imageMap = new Map((existing.images || []).map(image => [image.assetId, { ...image }]));
+  for (const image of (incoming.images || [])) {
+    const previous = imageMap.get(image.assetId) || {};
+    imageMap.set(image.assetId, {
+      ...previous, ...image,
+      alt: image.alt || previous.alt || '',
+      caption: image.caption || previous.caption || '',
+      fileName: image.fileName || previous.fileName || ''
+    });
+  }
   merged.images = [...imageMap.values()];
   for (const field of ['tables', 'equations']) {
     const keyFn = item => JSON.stringify(item);

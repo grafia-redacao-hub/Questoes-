@@ -18,7 +18,7 @@ const SUBJECTS = {
 const state = {
   db: null, data: {}, page: 'home', importDraft: null, currentActivity: null,
   activityAnswers: new Map(), activityTimer: null, activityStart: null,
-  reviewFilter: 'due', assetUrls: new Map(), restoreDraft: null, restoreConflicts: [], restoreChoices: {}, bankPage: 1, pendingBackup: null
+  reviewFilter: 'due', assetUrls: new Map(), restoreDraft: null, restoreConflicts: [], restoreChoices: {}, bankPage: 1, pendingBackup: null, finishingActivityId: null
 };
 
 function escapeHTML(value) {
@@ -177,7 +177,8 @@ function eligibleQuestions() {
   const topic = normalizeSearch($('#activityTopic').value);
   const difficulty = $('#activityDifficulty').value;
   const includeSolved = $('#includeSolved').checked;
-  const answeredIds = new Set(state.data.answers.filter(a => a.response !== '' && a.response != null).map(a => a.questionId));
+  const completedActivityIds = new Set(state.data.activities.filter(item => item.status === 'completed').map(item => item.id));
+  const answeredIds = new Set(state.data.answers.filter(a => completedActivityIds.has(a.activityId) && a.response !== '' && a.response != null && a.isCorrect != null).map(a => a.questionId));
   const dueIds = new Set(state.data.reviews.filter(r => r.status !== 'completed' && Date.parse(r.dueAt) <= Date.now()).map(r => r.questionId));
   return state.data.questions.filter(q => (!area || q.area === area) && (!subject || q.subject === subject) && (!topic || normalizeSearch([q.primaryTopic, ...(q.secondaryTopics || []), ...(q.subtopics || [])].join(' ')).includes(topic)) && (!difficulty || q.difficulty === difficulty) && (includeSolved || !answeredIds.has(q.id))).map(q => ({ ...q, isDue: dueIds.has(q.id) }));
 }
@@ -239,7 +240,7 @@ async function makeActivity() {
     config: {
       correctionMode: $('#correctionMode').value, showErrors: $('#showErrors').checked,
       commentMode: $('#commentMode').value, navigationMode: $('#navigationMode').value,
-      timerEnabled: $('#timerEnabled').checked, timerMinutes: Number($('#timerMinutes').value) || 90,
+      timerEnabled: $('#timerEnabled').checked, timerMinutes: Math.min(600, Math.max(1, Number($('#timerMinutes').value) || 90)),
       negativeScoring: $('#negativeScoring').checked, strategy
     }
   };
@@ -251,8 +252,17 @@ async function makeActivity() {
 }
 
 async function loadActivityAnswers(activityId) {
-  const answers = state.data.answers.filter(answer => answer.activityId === activityId);
+  // Read the persistent source of truth; the UI cache may be stale while an activity is open.
+  const allAnswers = await getAll(state.db, 'answers');
+  state.data.answers = allAnswers;
+  const answers = allAnswers.filter(answer => answer.activityId === activityId);
   state.activityAnswers = new Map(answers.map(answer => [answer.questionId, answer]));
+}
+function syncAnswerCache(record) {
+  state.activityAnswers.set(record.questionId, record);
+  const index = state.data.answers.findIndex(item => item.id === record.id);
+  if (index >= 0) state.data.answers[index] = record;
+  else state.data.answers.push(record);
 }
 function getResponseFromQuestion(questionId, question) {
   const card = document.querySelector(`[data-question-card="${CSS.escape(questionId)}"]`);
@@ -377,7 +387,7 @@ async function saveQuestionResponse(questionId) {
     updatedAt: nowISO()
   };
   await putRecord(state.db, 'answers', record);
-  state.activityAnswers.set(questionId, record);
+  syncAnswerCache(record);
   const card = document.querySelector(`[data-question-card="${CSS.escape(questionId)}"]`);
   if (!card) return;
   const feedback = $('#feedback-' + CSS.escape(questionId));
@@ -397,13 +407,13 @@ async function setConfidence(questionId, confidence) {
   const old = state.activityAnswers.get(questionId) || { id: `${state.currentActivity.id}::${questionId}`, activityId: state.currentActivity.id, questionId, response: '' };
   const next = { ...old, confidence, updatedAt: nowISO() };
   await putRecord(state.db, 'answers', next);
-  state.activityAnswers.set(questionId, next);
+  syncAnswerCache(next);
 }
 async function toggleReviewMark(questionId) {
   const old = state.activityAnswers.get(questionId) || { id: `${state.currentActivity.id}::${questionId}`, activityId: state.currentActivity.id, questionId, response: '' };
   const next = { ...old, markedForReview: !old.markedForReview, updatedAt: nowISO() };
   await putRecord(state.db, 'answers', next);
-  state.activityAnswers.set(questionId, next);
+  syncAnswerCache(next);
   const button = document.querySelector(`[data-action="mark-review"][data-id="${CSS.escape(questionId)}"]`);
   if (button) button.classList.toggle('active', next.markedForReview);
   $$('.exam-number').forEach(item => { if (item.dataset.jump === questionId) item.classList.toggle('review-mark', next.markedForReview); });
@@ -416,7 +426,7 @@ function startActivityTimer() {
     const limit = state.currentActivity.config.timerMinutes * 60;
     const remaining = limit - timeAgoSeconds(state.activityStart);
     updateTimerLabel(remaining);
-    if (remaining <= 0) { clearInterval(state.activityTimer); finishActivity(true); }
+    if (remaining <= 0) { clearInterval(state.activityTimer); finishActivity(true).catch(error => { state.finishingActivityId = null; console.error(error); toast('Não foi possível concluir a atividade automaticamente. Suas respostas continuam salvas.', 6000); }); }
   }, 1000);
 }
 function updateTimerLabel(remaining = null) {
@@ -429,7 +439,10 @@ function updateTimerLabel(remaining = null) {
 }
 async function finishActivity(timeExpired = false) {
   if (!state.currentActivity || state.currentActivity.status !== 'running') return;
+  const finishingId = state.currentActivity.id;
+  if (state.finishingActivityId === finishingId) return;
   if (!timeExpired && !confirm('Entregar esta atividade? As respostas salvas serão corrigidas e o resultado ficará no histórico.')) return;
+  state.finishingActivityId = finishingId;
   clearInterval(state.activityTimer);
   const activity = state.currentActivity;
   const questions = activity.questionIds.map(questionById).filter(Boolean);
@@ -472,6 +485,7 @@ async function finishActivity(timeExpired = false) {
   await putRecord(state.db, 'activities', completed);
   state.currentActivity = completed;
   await refreshData();
+  state.finishingActivityId = null;
   await renderResult(completed);
 }
 async function renderResult(activity) {
@@ -846,7 +860,15 @@ async function commitImport() {
 }
 
 async function createActivityFromIds(ids, title) {
-  const validIds = ids.filter(id=>questionById(id)); if (!validIds.length) return;
+  const running = state.data.activities.filter(item => item.status === 'running').sort((a,b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))[0];
+  if (running) {
+    state.currentActivity = running;
+    await loadActivityAnswers(running.id);
+    pageNavigate('activity');
+    toast('Há uma atividade em andamento. Retome-a antes de iniciar outra.');
+    return;
+  }
+  const validIds = [...new Set(ids.filter(id=>questionById(id)))]; if (!validIds.length) return;
   const activity = { id: makeId('activity'), title, questionIds: validIds, status: 'running', createdAt: nowISO(), startedAt: nowISO(), config: { correctionMode: 'end', showErrors: false, commentMode: 'available', navigationMode: 'free', timerEnabled: false, timerMinutes: 90, negativeScoring: false, strategy: 'import' } };
   await putRecord(state.db, 'activities', activity); state.currentActivity = activity; state.activityAnswers = new Map(); state.activityStart = Date.now(); await refreshData(); pageNavigate('activity');
 }
@@ -915,8 +937,9 @@ async function buildFullBackup() {
 }
 async function buildIncrementalBackup() {
   const databaseIdBefore = await getSetting(state.db, 'databaseId');
-  const checkpointSeq = Number(await getSetting(state.db, 'backupCheckpoint', 0)) || 0;
-  if (!checkpointSeq) throw new Error('Faça um backup completo antes do primeiro backup incremental.');
+  const savedCheckpoint = await getSetting(state.db, 'backupCheckpoint', null);
+  if (savedCheckpoint == null || !Number.isSafeInteger(Number(savedCheckpoint)) || Number(savedCheckpoint) < 0) throw new Error('Faça um backup completo antes do primeiro backup incremental.');
+  const checkpointSeq = Number(savedCheckpoint);
   const snapshot = await getChangesSnapshot(state.db, checkpointSeq);
   const changes = snapshot.changes;
   if (!changes.length) throw new Error('Não há alterações desde o último backup.');
@@ -926,7 +949,8 @@ async function buildIncrementalBackup() {
   const assets = []; const incremental = [];
   let assetIndex = 0;
   for (const change of latest.values()) {
-    if (change.table === 'changes') continue;
+    if (change.table === 'changes' || change.table === '__checkpoint__') continue;
+    if (change.table === 'settings' && ['backupCheckpoint','lastBackupType','appVersion','databaseId'].includes(change.id)) continue;
     if (change.action === 'delete') { incremental.push({ table: change.table, id: change.id, action: 'delete' }); continue; }
     let record = change.record;
     if (change.table === 'assetBlobs') record = await getOne(state.db, 'assetBlobs', change.id);
@@ -1001,8 +1025,10 @@ async function confirmBackupCheckpoint() {
   if (!pending) return;
   const currentId = await getSetting(state.db, 'databaseId');
   if (currentId !== pending.databaseId) throw new Error('O banco mudou desde a preparação do backup. Gere outro arquivo antes de atualizar o checkpoint.');
-  await setSetting(state.db, 'backupCheckpoint', pending.checkpointSeq);
-  await setSetting(state.db, 'lastBackupType', pending.type);
+  const tx = state.db.transaction('settings', 'readwrite');
+  tx.objectStore('settings').put({ key: 'backupCheckpoint', value: pending.checkpointSeq, updatedAt: nowISO() });
+  tx.objectStore('settings').put({ key: 'lastBackupType', value: pending.type, updatedAt: nowISO() });
+  await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onabort = () => reject(tx.error); tx.onerror = () => reject(tx.error); });
   state.pendingBackup = null;
   closeModal(); await refreshData();
   toast('Checkpoint atualizado. O próximo backup incremental partirá deste arquivo.');
@@ -1092,9 +1118,13 @@ async function beginRestore(file) {
     const backup = await parseBackup(file);
     if (backup.backupType === 'incremental') {
       const localId = await getSetting(state.db, 'databaseId');
-      const localCheckpoint = Number(await getSetting(state.db, 'backupCheckpoint', 0)) || 0;
+      const savedLocalCheckpoint = await getSetting(state.db, 'backupCheckpoint', null);
+      const localCheckpoint = Number(savedLocalCheckpoint);
       if (backup.databaseId !== localId) throw new Error('Este backup incremental pertence a outro banco. Restaure primeiro o backup completo correspondente.');
-      if (!localCheckpoint || backup.baseCheckpointSeq !== localCheckpoint) throw new Error('Este backup incremental não parte do último checkpoint deste dispositivo. Restaure os incrementais na sequência correta.');
+      if (savedLocalCheckpoint == null || !Number.isSafeInteger(localCheckpoint) || localCheckpoint < 0 || backup.baseCheckpointSeq !== localCheckpoint) throw new Error('Este backup incremental não parte do último checkpoint deste dispositivo. Restaure os incrementais na sequência correta.');
+      const localJournal = await getChangesSnapshot(state.db, 0);
+      const localChangesAfterCheckpoint = localJournal.changes.filter(change => (Number(change.seq) || 0) > localCheckpoint && !(change.table === 'settings' && ['backupCheckpoint','lastBackupType','appVersion','databaseId'].includes(change.id)));
+      if (localChangesAfterCheckpoint.length) throw new Error('Este dispositivo tem alterações locais depois do último checkpoint. Gere um novo backup completo antes de continuar.');
     }
     state.restoreDraft = backup;
     state.restoreChoices = {};
@@ -1125,22 +1155,22 @@ async function restoreBackup() {
       const records = { ...backup.records, settings: (backup.records.settings || []).filter(item => !['databaseId','backupCheckpoint'].includes(item.key)) };
       const report = await mergeAllData(state.db, records, state.restoreChoices);
       await setSetting(state.db, 'lastRestoreReport', report);
-      if (backup.databaseId === await getSetting(state.db, 'databaseId') && !(await getSetting(state.db, 'backupCheckpoint', null)) && backup.checkpointSeq) await setSetting(state.db, 'backupCheckpoint', backup.checkpointSeq);
+      if (backup.databaseId === await getSetting(state.db, 'databaseId') && (await getSetting(state.db, 'backupCheckpoint', null)) == null) await setSetting(state.db, 'backupCheckpoint', backup.checkpointSeq);
       toast(`Mesclagem concluída: ${report.inserted} novos, ${report.updated} atualizados, ${report.kept} mantidos. ${report.conflicts.length} conflitos identificados.`);
     } else {
       const txTables = [...new Set((backup.changes || []).map(change=>change.table).filter(name=>STORES.includes(name) && name !== 'changes'))];
-      const tx = state.db.transaction([...txTables, 'changes'], 'readwrite');
+      const tx = state.db.transaction([...new Set([...txTables, 'changes', 'settings'])], 'readwrite');
       const changeStore = tx.objectStore('changes');
       for (const change of backup.changes || []) {
         if (!STORES.includes(change.table) || change.table === 'changes') continue;
         const store = tx.objectStore(change.table);
         if (change.action === 'delete') store.delete(change.id);
         else store.put(change.record);
-        const journalRecord = change.table === 'assetBlobs' && change.record ? { id: change.record.id, size: change.record.blob?.size ?? change.record.size ?? 0, type: change.record.type || change.record.blob?.type || '' } : change.record;
-        changeStore.add({ table: change.table, id: change.id, action: change.action, record: change.action === 'upsert' ? journalRecord : undefined, changedAt: nowISO() });
       }
+      // Preserve the source sequence instead of creating a second local journal lineage.
+      changeStore.put({ seq: backup.checkpointSeq, table: '__checkpoint__', id: 'incremental-restore', action: 'checkpoint', changedAt: nowISO() });
+      tx.objectStore('settings').put({ key: 'backupCheckpoint', value: backup.checkpointSeq, updatedAt: nowISO() });
       await new Promise((resolve,reject)=>{ tx.oncomplete=resolve; tx.onabort=()=>reject(tx.error); tx.onerror=()=>reject(tx.error); });
-      await setSetting(state.db, 'backupCheckpoint', backup.checkpointSeq);
       toast('Backup incremental aplicado.');
     }
     state.restoreDraft = null; closeModal(); clearAssetUrlCache(); await refreshData(); pageNavigate('home');
@@ -1168,7 +1198,7 @@ async function clearDatabase() {
   for (const store of STORES) tx.objectStore(store).clear();
   await new Promise((resolve,reject)=>{ tx.oncomplete=resolve; tx.onabort=()=>reject(tx.error); tx.onerror=()=>reject(tx.error); });
   await setSetting(state.db, 'databaseId', crypto.randomUUID());
-  await setSetting(state.db, 'appVersion', '1.0.0');
+  await setSetting(state.db, 'appVersion', '1.0.1');
   state.currentActivity = null; state.activityAnswers.clear();
   clearAssetUrlCache();
   await refreshData(); pageNavigate('home'); toast('Dados locais removidos.');
@@ -1243,7 +1273,7 @@ document.addEventListener('click', async event => {
     else if (action === 'confirm-backup-checkpoint') await confirmBackupCheckpoint();
     else if (action === 'confirm-restore') await restoreBackup();
     else if (action === 'clear-database') await clearDatabase();
-  } catch (error) { console.error(error); toast(error.message || 'A operação não pôde ser concluída.', 5500); }
+  } catch (error) { if (action === 'finish-activity') state.finishingActivityId = null; console.error(error); toast(error.message || 'A operação não pôde ser concluída.', 5500); }
 });
 
 document.addEventListener('change', async event => {
