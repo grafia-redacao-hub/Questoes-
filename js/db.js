@@ -1,5 +1,5 @@
 const DB_NAME = 'grafia-questoes-db';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 
 function requestPromise(request) {
   return new Promise((resolve, reject) => {
@@ -61,6 +61,9 @@ export async function openDB() {
     const imports = ensure('imports', { keyPath: 'id' });
     if (!imports.indexNames.contains('createdAt')) imports.createIndex('createdAt', 'createdAt', { unique: false });
     ensure('aliases', { keyPath: 'alias' });
+    const topics = ensure('topics', { keyPath: 'id' });
+    if (!topics.indexNames.contains('normalized')) topics.createIndex('normalized', 'normalized', { unique: false });
+    if (!topics.indexNames.contains('label')) topics.createIndex('label', 'label', { unique: false });
     ensure('changes', { keyPath: 'seq', autoIncrement: true });
   };
   const db = await requestPromise(request);
@@ -77,7 +80,7 @@ async function ensureInitialSettings(db) {
     if (!currentReq.result) store.put({ key: 'databaseId', value: crypto.randomUUID() });
     const versionReq = store.get('appVersion');
     versionReq.onsuccess = () => {
-      if (versionReq.result?.value !== '1.0.1') store.put({ key: 'appVersion', value: '1.0.1' });
+      if (versionReq.result?.value !== '1.5.6') store.put({ key: 'appVersion', value: '1.5.6' });
     };
   };
   await done;
@@ -136,6 +139,20 @@ export async function deleteRecord(db, storeName, id) {
   await transactionDone(tx);
 }
 
+export async function deleteRecords(db, storeName, ids) {
+  const uniqueIds = [...new Set((ids || []).filter(id => id != null))];
+  if (!uniqueIds.length) return;
+  const now = new Date().toISOString();
+  const tx = db.transaction([storeName, 'changes'], 'readwrite');
+  const store = tx.objectStore(storeName);
+  const changes = tx.objectStore('changes');
+  for (const id of uniqueIds) {
+    store.delete(id);
+    changes.add({ table: storeName, id, action: 'delete', changedAt: now });
+  }
+  await transactionDone(tx);
+}
+
 export async function writeBatch(db, recordsByStore, aliases = []) {
   const storeNames = [...new Set([...Object.keys(recordsByStore), ...(aliases.length ? ['aliases'] : []), 'changes'])];
   const tx = db.transaction(storeNames, 'readwrite');
@@ -162,7 +179,7 @@ export async function writeBatch(db, recordsByStore, aliases = []) {
 }
 
 export async function replaceAllData(db, recordsByStore) {
-  const names = ['questions', 'assets', 'assetBlobs', 'textBases', 'activities', 'answers', 'reviews', 'notes', 'collections', 'settings', 'imports', 'aliases', 'changes'];
+  const names = ['questions', 'assets', 'assetBlobs', 'textBases', 'activities', 'answers', 'reviews', 'notes', 'collections', 'settings', 'imports', 'aliases', 'topics', 'changes'];
   const tx = db.transaction(names, 'readwrite');
   for (const name of names) {
     const store = tx.objectStore(name);
@@ -247,7 +264,7 @@ export async function listChanges(db, afterSequence = 0) {
 }
 
 export async function countAll(db) {
-  const names = ['questions', 'assets', 'activities', 'answers', 'reviews', 'notes', 'collections', 'imports'];
+  const names = ['questions', 'assets', 'activities', 'answers', 'reviews', 'notes', 'collections', 'imports', 'topics'];
   const tx = db.transaction(names, 'readonly');
   const done = transactionDone(tx);
   const counts = await Promise.all(names.map(name => requestPromise(tx.objectStore(name).count())));

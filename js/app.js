@@ -1,32 +1,113 @@
-import { openDB, getAll, getAllStoresSnapshot, getChangesSnapshot, getOne, putRecord, deleteRecord, writeBatch, replaceAllData, mergeAllData, getSetting, setSetting, countAll } from './db.js';
+import { openDB, getAll, getAllStoresSnapshot, getChangesSnapshot, getOne, putRecord, deleteRecord, deleteRecords, writeBatch, replaceAllData, mergeAllData, getSetting, setSetting, countAll } from './db.js';
 import { prepareQuestionImport, mergeQuestion, normalizeSearch } from './importer.js';
 import { readZip, writeZip, downloadBlob } from './zip.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+// Remove obsolete floating navigation markers left by older interface builds.
+document.querySelectorAll('.nav-indicator, .nav-bubble, .nav-orb, .navigation-indicator, .floating-nav-indicator, .nav-active-indicator, .nav-marker, .active-nav-marker, .nav-active-marker, #navIndicator, #navBubble, #navMarker, [data-nav-indicator], [data-nav-bubble], [data-nav-marker]').forEach(element => element.remove());
 const nowISO = () => new Date().toISOString();
 const makeId = prefix => `${prefix}-${crypto.randomUUID()}`;
-const STORES = ['questions', 'assets', 'assetBlobs', 'textBases', 'activities', 'answers', 'reviews', 'notes', 'collections', 'settings', 'imports', 'aliases', 'changes'];
+const STORES = ['questions', 'assets', 'assetBlobs', 'textBases', 'activities', 'answers', 'reviews', 'notes', 'collections', 'settings', 'imports', 'aliases', 'topics', 'changes'];
 const DATA_STORES = STORES.filter(name => !['assetBlobs', 'changes'].includes(name));
-const BANK_PAGE_SIZE = 40;
+const BANK_PAGE_SIZE = 30;
+let sortedQuestionsSource = null;
+let sortedQuestionsCache = [];
+let activityTopicCache = { questions: null, topics: null, items: [], counts: new Map() };
+let bankSearchTimer = null;
+let questionMapSource = null;
+let questionByIdMap = new Map();
+let textBaseMapSource = null;
+let textBaseByIdMap = new Map();
+let answerMapSource = null;
+let answerByIdMap = new Map();
+let assetImageObserver = null;
+const assetLoadPromises = new Map();
+const questionSearchCache = new WeakMap();
+let activityNavigationFrame = null;
+let activityNavigationScrollHandler = null;
+let activityNavigationResizeHandler = null;
 const SUBJECTS = {
   'Linguagens': ['Português', 'Literatura', 'Inglês', 'Espanhol', 'Artes', 'Educação Física'],
   'Ciências Humanas': ['História', 'Geografia', 'Filosofia', 'Sociologia'],
   'Ciências da Natureza': ['Biologia', 'Química', 'Física'],
   'Exatas': ['Matemática']
 };
+const TOPIC_CATALOG = {"Matemática":["Matemática Básica","Razão e Proporção","Porcentagem","Escala","Interpretação de Gráficos e Tabelas","Estatística","Média, Moda e Mediana","Função do 1º Grau","Função do 2º Grau","Geometria Plana","Geometria Espacial","Matemática Financeira","Probabilidade","Análise Combinatória","Trigonometria"],"Linguagens":["Interpretação de Texto","Gêneros Literários e Textuais","Estratégias Argumentativas","Variedades Linguísticas","Funções da Linguagem","Escolas Literárias","Linguagem Digital"],"Biologia":["Ecologia","Biomas","Fisiologia Humana","Metabolismo Energético","Citologia","Genética e Biotecnologia","Parasitologia","Bioquímica"],"Química":["Estudo da Matéria","Estrutura Atômica","Tabela Periódica","Funções Inorgânicas","Estequiometria","Solubilidade","Termoquímica","Cinética","Equilíbrio Químico","Eletroquímica","Química Orgânica","Isomeria","Reações Orgânicas","Química Ambiental","Separação de Misturas"],"Física":["Unidades de Medida","Movimento e Lançamentos","Dinâmica e Leis de Newton","Hidrostática","Trabalho e Energia","Termologia","Óptica Geométrica","Ondas","Eletrostática","Eletrodinâmica"],"Geografia":["Agricultura","Geografia Urbana","Geografia Populacional","Globalização","Cartografia","Estrutura da Terra","Fontes de Energia","Questão Ambiental","Atualidades"],"História do Brasil":["Expansão Mercantil","Grandes Navegações","Sistema Colonial","Expansão Territorial","Economia Mineradora","Processo de Independência","Segundo Reinado","República Oligárquica","Era Vargas","Regime Militar","Brasil Atual"],"História Geral":["Grécia Antiga","Civilização Romana","Sistema Feudal","Baixa Idade Média","Renascimento e Mercantilismo","Absolutismo e Revolução Industrial","Iluminismo e Independência dos EUA","Revolução Francesa","Era Napoleônica e Neocolonialismo","1ª e 2ª Guerra Mundial","Guerra Fria"],"Filosofia":["Escola Helenística","Escola Sofística","Aristóteles, Sócrates e Platão","Racionalismo Moderno","Kant e Nietzsche","Filosofia Medieval e Moderna"],"Sociologia":["Cidadania, Cultura e Educação","Política, Poder e Estado","Capitalismo","Economia e Sociedade","Indústria Cultural","Max Weber","Sociologia Contemporânea","O Mundo Globalizado"]};
+const TOPIC_SUBJECTS = {
+  'Matemática': ['Matemática'], 'Linguagens': ['Português','Literatura','Inglês','Espanhol','Artes','Educação Física'],
+  'Biologia': ['Biologia'], 'Química': ['Química'], 'Física': ['Física'], 'Geografia': ['Geografia'],
+  'História do Brasil': ['História'], 'História Geral': ['História'], 'Filosofia': ['Filosofia'], 'Sociologia': ['Sociologia']
+};
+const SUBJECT_AREAS = Object.fromEntries(Object.entries(SUBJECTS).flatMap(([area, subjects]) => subjects.map(subject => [subject, area])));
 const state = {
   db: null, data: {}, page: 'home', importDraft: null, currentActivity: null,
   activityAnswers: new Map(), activityTimer: null, activityStart: null,
-  reviewFilter: 'due', assetUrls: new Map(), restoreDraft: null, restoreConflicts: [], restoreChoices: {}, bankPage: 1, pendingBackup: null, finishingActivityId: null
+  reviewFilter: 'due', assetUrls: new Map(), restoreDraft: null, restoreConflicts: [], restoreChoices: {}, bankPage: 1, pendingBackup: null, finishingActivityId: null,
+  bankTab: 'questions', performancePeriod: 'all', performanceArea: '', performanceSubject: '', performanceTopic: '', importTaskDraft: null, selectedPackageKeys: new Set(),
+  activityFilters: { areas: [], subjects: [], topics: [] },
+  activityTopicPickerOpen: false, activityTopicSearch: '', longPressTimer: null, longPressFiredAt: 0, longPressPointerId: null
 };
 
 function escapeHTML(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 }
 function safeAttr(value) { return escapeHTML(value).replace(/`/g, '&#96;'); }
+function normalizeWebUrl(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '';
+  } catch { return ''; }
+}
+function linkifyText(value) {
+  const pattern = /(\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|https?:\/\/[^\s<>"']+)/gi;
+  return String(value ?? '').replace(pattern, (match, _all, markdownLabel, markdownUrl) => {
+    const isMarkdownLink = Boolean(markdownUrl);
+    const trailing = isMarkdownLink ? '' : (match.match(/[.,;:!?)}\]]+$/) || [''])[0];
+    const rawUrl = isMarkdownLink ? markdownUrl : (trailing ? match.slice(0, -trailing.length) : match);
+    const href = normalizeWebUrl(rawUrl);
+    if (!href) return escapeHTML(match);
+    let host = '';
+    try { host = new URL(href).hostname.replace(/^www\./i, ''); } catch {}
+    const label = markdownLabel ? escapeHTML(markdownLabel) : escapeHTML(host || 'link externo');
+    return `<a class="content-link" href="${safeAttr(href)}" target="_blank" rel="noopener noreferrer" title="${safeAttr(href)}" aria-label="Abrir referência externa: ${safeAttr(host || 'link')}"><span aria-hidden="true">↗</span><span>${label}</span></a>${escapeHTML(trailing)}`;
+  });
+}
 function richText(value) {
-  return escapeHTML(value).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>').replace(/\n/g, '<br>');
+  return linkifyText(value).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>').replace(/\n/g, '<br>');
+}
+function questionStatementHTML(value) {
+  // The label "Comando" should read as ordinary text, not as a highlighted heading.
+  return richText(value).replace(/<strong>(\s*comando(?:\s+da\s+quest[aã]o)?\s*:?)<\/strong>/gi, '<span class="question-command">$1</span>');
+}
+function renderExternalReference(url, label = 'Abrir referência') {
+  const href = normalizeWebUrl(url);
+  if (!href) return '';
+  let host = '';
+  try { host = new URL(href).hostname.replace(/^www\./i, ''); } catch {}
+  return `<a class="question-reference-link" href="${safeAttr(href)}" target="_blank" rel="noopener noreferrer"><span class="reference-link-icon" aria-hidden="true">↗</span><span class="reference-link-copy"><b>${escapeHTML(label)}</b><small>${escapeHTML(host || href)}</small></span></a>`;
+}
+function renderQuestionReferences(question) {
+  const source = question.source && typeof question.source === 'object' ? question.source : {};
+  const candidates = [
+    { url: typeof question.source === 'string' ? question.source : '', label: 'Fonte da questão' },
+    { url: source.url || source.link || source.href || source.sourceUrl || source.sourceURL, label: source.linkLabel || source.label || source.name || 'Fonte da questão' },
+    { url: question.sourceUrl || question.sourceURL || question.sourceLink || question.referenceUrl, label: 'Fonte da questão' }
+  ];
+  for (const item of [...(Array.isArray(question.links) ? question.links : []), ...(Array.isArray(question.references) ? question.references : [])]) {
+    if (typeof item === 'string') candidates.push({ url: item, label: 'Referência da questão' });
+    else if (item && typeof item === 'object') candidates.push({ url: item.url || item.href || item.link, label: item.label || item.title || item.name || 'Referência da questão' });
+  }
+  const seen = new Set();
+  const rendered = candidates.map(item => {
+    const href = normalizeWebUrl(item.url);
+    if (!href || seen.has(href)) return '';
+    seen.add(href);
+    return renderExternalReference(href, item.label);
+  }).filter(Boolean);
+  return rendered.length ? `<section class="question-references" aria-label="Fontes e links da questão"><div class="reference-section-label">FONTES E LINKS</div><div class="question-reference-list">${rendered.join('')}</div></section>` : '';
 }
 function formatDate(value, withTime = false) {
   if (!value) return '—';
@@ -47,7 +128,7 @@ function toast(message, duration = 2800) {
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => element.classList.add('hidden'), duration);
 }
-function openModal(title, body, footer = '', eyebrow = 'GRAFIA QUESTÕES') {
+function openModal(title, body, footer = '', eyebrow = 'GRAFIA QUESTIONS') {
   $('#modalEyebrow').textContent = eyebrow;
   $('#modalTitle').textContent = title;
   $('#modalBody').innerHTML = body;
@@ -57,11 +138,12 @@ function openModal(title, body, footer = '', eyebrow = 'GRAFIA QUESTÕES') {
 }
 function closeModal() {
   $('#modalBackdrop').classList.add('hidden');
+  unobserveAssetImages($('#modalBody'));
   $('#modalBody').innerHTML = '';
   $('#modalFooter').innerHTML = '';
 }
 
-async function refreshData() {
+async function refreshData(render = true) {
   const pairs = await Promise.all(DATA_STORES.map(async name => [name, await getAll(state.db, name)]));
   state.data = Object.fromEntries(pairs);
   state.data.questions ||= [];
@@ -74,24 +156,77 @@ async function refreshData() {
   state.data.collections ||= [];
   state.data.imports ||= [];
   state.data.aliases ||= [];
-  renderAll();
+  state.data.topics ||= [];
+  // The activity picker only exposes the fixed 100-topic catalog and topics
+  // deliberately saved by the user. Legacy question-derived entries are purged.
+  const savedTopics = state.data.topics.filter(isCustomTopic);
+  const obsoleteTopicIds = state.data.topics.filter(topic => !isCustomTopic(topic)).map(topic => topic.id);
+  if (obsoleteTopicIds.length) await deleteRecords(state.db, 'topics', obsoleteTopicIds);
+  state.data.topics = savedTopics;
+  activityTopicCache = { questions: null, topics: null, items: [], counts: new Map() };
+  if (render) renderAll();
 }
-function questionById(id) { return state.data.questions.find(q => q.id === id); }
-function answerById(id) { return state.data.answers.find(a => a.id === id); }
-function sortedQuestions() { return [...state.data.questions].sort((a, b) => (a.subject || '').localeCompare(b.subject || '') || (a.primaryTopic || '').localeCompare(b.primaryTopic || '') || a.id.localeCompare(b.id)); }
+function questionById(id) {
+  if (questionMapSource !== state.data.questions) {
+    questionMapSource = state.data.questions;
+    questionByIdMap = new Map(questionMapSource.map(question => [question.id, question]));
+  }
+  return questionByIdMap.get(id);
+}
+function textBaseById(id) {
+  if (textBaseMapSource !== state.data.textBases) {
+    textBaseMapSource = state.data.textBases;
+    textBaseByIdMap = new Map(textBaseMapSource.map(item => [item.id, item]));
+  }
+  return textBaseByIdMap.get(id);
+}
+function answerById(id) {
+  if (answerMapSource !== state.data.answers) {
+    answerMapSource = state.data.answers;
+    answerByIdMap = new Map(answerMapSource.map(answer => [answer.id, answer]));
+  }
+  return answerByIdMap.get(id);
+}
+function sortedQuestions() {
+  if (sortedQuestionsSource !== state.data.questions) {
+    sortedQuestionsSource = state.data.questions;
+    sortedQuestionsCache = [...state.data.questions].sort((a, b) => (a.subject || '').localeCompare(b.subject || '') || (a.primaryTopic || '').localeCompare(b.primaryTopic || '') || a.id.localeCompare(b.id));
+  }
+  return sortedQuestionsCache;
+}
+function questionSearchText(question) {
+  let value = questionSearchCache.get(question);
+  if (value === undefined) {
+    value = normalizeSearch([question.id, question.statement, question.primaryTopic, ...(question.secondaryTopics || []), ...(question.subtopics || []), question.subject, question.area, question.source?.name, question.source?.exam].join(' '));
+    questionSearchCache.set(question, value);
+  }
+  return value;
+}
+function topicValues(question) {
+  return [...new Set([question.primaryTopic, ...(question.secondaryTopics || []), ...(question.subtopics || [])]
+    .map(value => String(value || '').trim()).filter(Boolean))];
+}
+function isCustomTopic(topic) {
+  return Boolean(topic && (topic.custom === true || topic.source === 'custom') && String(topic.label || '').trim());
+}
+
 function completedAnswers() { const ids = new Set(state.data.activities.filter(item => item.status === 'completed').map(item => item.id)); return state.data.answers.filter(item => ids.has(item.activityId) && item.response !== '' && item.response != null && item.isCorrect != null); }
 function clearAssetUrlCache() {
+  assetImageObserver?.disconnect();
+  assetImageObserver = null;
+  assetLoadPromises.clear();
   for (const url of state.assetUrls.values()) URL.revokeObjectURL(url);
   state.assetUrls.clear();
 }
 
 function pageNavigate(page) {
   if (!page) return;
+  if (page !== 'activity' || state.currentActivity?.status !== 'running') unbindActivityNavigationSync();
   state.page = page;
   $$('.page').forEach(element => element.classList.toggle('active', element.dataset.pageId === page));
   $$('.nav-item[data-page]').forEach(element => element.classList.toggle('active', element.dataset.page === page));
   if (page === 'home') renderHome();
-  if (page === 'bank') renderBank();
+  if (page === 'bank') { renderBank(); renderPackageHistory(); setBankTab(state.bankTab); }
   if (page === 'activity') { if (state.currentActivity?.status === 'running') { renderSession(); startActivityTimer(); } else renderActivityBuilder(); }
   if (page === 'performance') renderPerformance();
   if (page === 'reviews') renderReviews();
@@ -102,11 +237,20 @@ function pageNavigate(page) {
 
 function renderAll() {
   $('#todayLabel').textContent = new Intl.DateTimeFormat('pt-BR', { weekday: 'short', day: '2-digit', month: 'short' }).format(new Date());
-  renderHome(); renderBank(); renderActivityBuilder(); renderPerformance(); renderReviews(); renderLibrary(); renderSettings();
-  const running = [...state.data.activities].filter(item => item.status === 'running').sort((a,b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))[0];
+  // Only render the visible section. Other pages are rendered when opened.
+  renderHome();
+  if (state.page === 'bank') { renderBank(); renderPackageHistory(); setBankTab(state.bankTab); }
+  if (state.page === 'activity') { if (state.currentActivity?.status === 'running') { renderSession(); startActivityTimer(); } else renderActivityBuilder(); }
+  if (state.page === 'performance') renderPerformance();
+  if (state.page === 'reviews') renderReviews();
+  if (state.page === 'library') renderLibrary();
+  if (state.page === 'settings') renderSettings();
+  const running = state.data.activities.filter(item => item.status === 'running').sort((a,b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))[0];
   if (running && !state.currentActivity) {
     state.currentActivity = running;
-    loadActivityAnswers(running.id).then(() => { if (state.page === 'activity') renderSession(); });
+    loadActivityAnswers(running.id).then(() => {
+      if (state.page === 'activity') { renderSession(); startActivityTimer(); }
+    });
   }
 }
 
@@ -152,10 +296,9 @@ function renderBank() {
   const difficulty = $('#filterDifficulty').value;
   const type = $('#filterType').value;
   const onlyFavorites = $('#onlyFavorites').checked;
-  const list = sortedQuestions().filter(q => {
-    const haystack = normalizeSearch([q.id, q.statement, q.primaryTopic, ...(q.secondaryTopics || []), ...(q.subtopics || []), q.subject, q.area, q.source?.name, q.source?.exam].join(' '));
-    return (!search || haystack.includes(search)) && (!area || q.area === area) && (!subject || q.subject === subject) && (!difficulty || q.difficulty === difficulty) && (!type || q.type === type) && (!onlyFavorites || q.favorite);
-  });
+  const list = sortedQuestions().filter(q =>
+    (!search || questionSearchText(q).includes(search)) && (!area || q.area === area) && (!subject || q.subject === subject) && (!difficulty || q.difficulty === difficulty) && (!type || q.type === type) && (!onlyFavorites || q.favorite)
+  );
   const pageCount = Math.max(1, Math.ceil(list.length / BANK_PAGE_SIZE));
   state.bankPage = Math.min(state.bankPage, pageCount);
   const start = (state.bankPage - 1) * BANK_PAGE_SIZE;
@@ -163,27 +306,148 @@ function renderBank() {
   $('#bankCount').textContent = `${list.length.toLocaleString('pt-BR')} ${list.length === 1 ? 'questão encontrada' : 'questões encontradas'}`;
   $('#bankEmpty').classList.toggle('hidden', state.data.questions.length > 0 || search || area || subject || difficulty || type || onlyFavorites);
   if (!list.length && state.data.questions.length) {
-    $('#bankList').innerHTML = '<div class="glass-card empty-inline"><span class="empty-symbol">⌕</span><b>Nenhum resultado encontrado</b><p>Experimente remover algum filtro ou alterar os termos de busca.</p></div>';
+    $('#bankList').innerHTML = '<div class="glass-card empty-inline"><span class="empty-symbol">⌕</span><b>Nenhum resultado encontrado</b></div>';
     $('#bankPagination').innerHTML = '';
     return;
   }
-  $('#bankList').innerHTML = visible.map(q => `<article class="question-row"><div class="question-number">${escapeHTML(String(q.sourceQuestionNumber || '•'))}</div><div><div class="question-meta"><span class="tag peach">${escapeHTML(q.subject || q.area)}</span><span class="tag">${escapeHTML(q.primaryTopic || 'Sem assunto')}</span><span class="tag">${escapeHTML(q.difficulty || 'Sem nível')}</span>${q.explanation || Object.keys(q.alternativeExplanations || {}).length ? '<span class="tag">Comentada</span>' : '<span class="tag">Gabarito</span>'}${q.images?.length ? '<span class="tag">Imagem</span>' : ''}${(q.relatedSubjects||[]).map(item=>`<span class="tag">Interdisciplinar: ${escapeHTML(item)}</span>`).join('')}${q.classificationConfidence != null ? `<span class="tag">Classificação ${Math.round(q.classificationConfidence*100)}% confiança</span>` : ''}</div><h3>${escapeHTML(q.id)}</h3><p>${escapeHTML(q.statement)}</p></div><div class="row-actions"><button class="icon-action ${q.favorite ? 'active' : ''}" data-action="favorite" data-id="${safeAttr(q.id)}" title="${q.favorite ? 'Remover favorita' : 'Favoritar'}">${q.favorite ? '★' : '☆'}</button><button class="icon-action" data-open-question="${safeAttr(q.id)}" title="Abrir questão">↗</button></div></article>`).join('');
+  $('#bankList').innerHTML = visible.map(q => `<article class="question-row"><div class="question-number">${escapeHTML(String(q.sourceQuestionNumber || '•'))}</div><div><div class="question-meta"><span class="tag peach">${escapeHTML(q.subject || q.area)}</span><span class="tag">${escapeHTML(q.primaryTopic || 'Sem assunto')}</span><span class="tag">${escapeHTML(q.difficulty || 'Sem nível')}</span>${hasExplanationContent(q) ? '<span class="tag">Comentada</span>' : '<span class="tag">Gabarito</span>'}${q.images?.length ? '<span class="tag">Imagem</span>' : ''}${(q.relatedSubjects||[]).map(item=>`<span class="tag">Interdisciplinar: ${escapeHTML(item)}</span>`).join('')}${q.classificationConfidence != null ? `<span class="tag">Classificação ${Math.round(q.classificationConfidence*100)}% confiança</span>` : ''}</div><h3>${escapeHTML(q.id)}</h3><p>${richText(q.statement)}</p>${renderQuestionReferences(q)}</div><div class="row-actions"><button class="icon-action ${q.favorite ? 'active' : ''}" data-action="favorite" data-id="${safeAttr(q.id)}" title="${q.favorite ? 'Remover favorita' : 'Favoritar'}">${q.favorite ? '★' : '☆'}</button><button class="icon-action" data-open-question="${safeAttr(q.id)}" title="Abrir questão">↗</button></div></article>`).join('');
   $('#bankPagination').innerHTML = pageCount > 1 ? `<span class="fine-print">Página ${state.bankPage} de ${pageCount}</span><div class="pagination-actions"><button class="button secondary" data-bank-page="${Math.max(1,state.bankPage-1)}" ${state.bankPage===1?'disabled':''}>Anterior</button><button class="button secondary" data-bank-page="${Math.min(pageCount,state.bankPage+1)}" ${state.bankPage===pageCount?'disabled':''}>Próxima</button></div>` : '';
 }
 
 function eligibleQuestions() {
-  const area = $('#activityArea').value;
-  const subject = $('#activitySubject').value;
-  const topic = normalizeSearch($('#activityTopic').value);
+  const { areas, subjects, topics } = state.activityFilters;
   const difficulty = $('#activityDifficulty').value;
   const includeSolved = $('#includeSolved').checked;
+  const hasContentFilters = areas.length > 0 || subjects.length > 0;
+  const normalizedTopics = topics.map(normalizeSearch).filter(Boolean);
   const completedActivityIds = new Set(state.data.activities.filter(item => item.status === 'completed').map(item => item.id));
   const answeredIds = new Set(state.data.answers.filter(a => completedActivityIds.has(a.activityId) && a.response !== '' && a.response != null && a.isCorrect != null).map(a => a.questionId));
   const dueIds = new Set(state.data.reviews.filter(r => r.status !== 'completed' && Date.parse(r.dueAt) <= Date.now()).map(r => r.questionId));
-  return state.data.questions.filter(q => (!area || q.area === area) && (!subject || q.subject === subject) && (!topic || normalizeSearch([q.primaryTopic, ...(q.secondaryTopics || []), ...(q.subtopics || [])].join(' ')).includes(topic)) && (!difficulty || q.difficulty === difficulty) && (includeSolved || !answeredIds.has(q.id))).map(q => ({ ...q, isDue: dueIds.has(q.id) }));
+  return state.data.questions.filter(q => {
+    const contentMatch = !hasContentFilters || areas.includes(q.area) || subjects.includes(q.subject);
+    const questionTopics = topicValues(q).map(normalizeSearch);
+    const topicMatch = !normalizedTopics.length || normalizedTopics.some(topic => questionTopics.some(value => value.includes(topic)));
+    return contentMatch && topicMatch && (!difficulty || q.difficulty === difficulty) && (includeSolved || !answeredIds.has(q.id));
+  }).map(q => ({ ...q, isDue: dueIds.has(q.id) }));
 }
+function buildActivityTopicCatalog() {
+  const questions = state.data.questions || [];
+  const topics = state.data.topics || [];
+  if (activityTopicCache.questions === questions && activityTopicCache.topics === topics) return activityTopicCache.items;
+  const catalog = new Map();
+  const addCatalogTopic = (label, source, subjects = [], areas = []) => {
+    const normalized = normalizeSearch(label);
+    if (!normalized) return;
+    const old = catalog.get(normalized) || { label, normalized, subjects: [], areas: [], source };
+    old.subjects = [...new Set([...old.subjects, ...subjects])];
+    old.areas = [...new Set([...old.areas, ...areas])];
+    if (source === 'catalog' || old.source !== 'catalog') old.source = source;
+    catalog.set(normalized, old);
+  };
+  // These are the 100 fixed topics supplied by the user. Imported questions
+  // never add labels or subject/area associations to this list.
+  for (const [discipline, labels] of Object.entries(TOPIC_CATALOG)) {
+    const subjects = TOPIC_SUBJECTS[discipline] || [];
+    const areas = [...new Set(subjects.map(subject => SUBJECT_AREAS[subject]).filter(Boolean))];
+    for (const label of labels) addCatalogTopic(label, 'catalog', subjects, areas);
+  }
+  // Only explicitly saved custom topics are appended to the fixed catalog.
+  for (const topic of topics) {
+    if (!isCustomTopic(topic)) continue;
+    const label = String(topic.label || '').trim();
+    if (label) addCatalogTopic(label, 'custom', topic.subjects || [], topic.areas || []);
+  }
+  const counts = new Map();
+  for (const question of questions) {
+    for (const label of topicValues(question)) {
+      const normalized = normalizeSearch(label);
+      // Counts are metadata only: a question cannot create a catalog item.
+      if (!catalog.has(normalized)) continue;
+      let stat = counts.get(normalized);
+      if (!stat) counts.set(normalized, stat = { total: 0, pairs: new Map() });
+      stat.total++;
+      const pair = `${question.area || ''}\u0000${question.subject || ''}`;
+      stat.pairs.set(pair, (stat.pairs.get(pair) || 0) + 1);
+    }
+  }
+  const items = [...catalog.values()].sort((a,b) => a.label.localeCompare(b.label, 'pt-BR'));
+  activityTopicCache = { questions, topics, items, counts };
+  return items;
+}
+function activityTopicOptions() {
+  const selectedSubjects = state.activityFilters.subjects;
+  const selectedAreas = state.activityFilters.areas;
+  let options = buildActivityTopicCatalog();
+  if (selectedSubjects.length) options = options.filter(item => !item.subjects.length || item.subjects.some(subject => selectedSubjects.includes(subject)));
+  else if (selectedAreas.length) options = options.filter(item => !item.areas.length || item.areas.some(area => selectedAreas.includes(area)));
+  const query = normalizeSearch(state.activityTopicSearch);
+  if (query) options = options.filter(item => item.normalized.includes(query));
+  return options;
+}
+function renderActivityTopicList() {
+  const host = $('#activityTopicList');
+  if (!host) return;
+  const selected = new Set(state.activityFilters.topics.map(normalizeSearch));
+  const options = activityTopicOptions();
+  const rows = options.map(item => {
+    const active = selected.has(item.normalized);
+    const stats = activityTopicCache.counts.get(item.normalized);
+    let matchCount = stats?.total || 0;
+    const selectedSubjects = state.activityFilters.subjects;
+    const selectedAreas = state.activityFilters.areas;
+    if (stats && (selectedSubjects.length || selectedAreas.length)) {
+      matchCount = 0;
+      for (const [pair, amount] of stats.pairs) {
+        const [pairArea, pairSubject] = pair.split('\u0000');
+        if ((!selectedSubjects.length || selectedSubjects.includes(pairSubject)) && (!selectedAreas.length || selectedAreas.includes(pairArea))) matchCount += amount;
+      }
+    }
+    const countLabel = matchCount ? `${matchCount} questões` : item.source === 'custom' ? 'personalizado' : 'catálogo';
+    return `<label class="topic-choice ${active ? 'selected' : ''}"><input type="checkbox" data-toggle-activity-topic="${safeAttr(item.label)}" ${active ? 'checked' : ''}><span>${escapeHTML(item.label)}</span><small>${countLabel}</small></label>`;
+  }).join('');
+  const rawSearch = String(state.activityTopicSearch || '').trim();
+  const normalizedSearch = normalizeSearch(rawSearch);
+  const exactExists = normalizedSearch && buildActivityTopicCatalog().some(item => item.normalized === normalizedSearch);
+  const saveAction = rawSearch && !exactExists
+    ? `<button type="button" class="topic-save-custom" data-save-activity-topic="${safeAttr(rawSearch)}">＋ Salvar “${escapeHTML(rawSearch)}” como assunto personalizado</button>`
+    : '';
+  host.innerHTML = `${rows || (rawSearch ? '<div class="empty-inline topic-empty">Nenhum assunto correspondente.</div>' : '<div class="empty-inline topic-empty">Nenhum assunto disponível.</div>')}${saveAction}`;
+  const count = state.activityFilters.topics.length;
+  const summary = $('#activityTopicSummary');
+  if (summary) summary.textContent = count ? `${count} assunto${count === 1 ? '' : 's'} selecionado${count === 1 ? '' : 's'}` : 'Nenhum assunto selecionado';
+}
+
+function renderSavedActivities() {
+  const section = $('#savedActivitiesSection');
+  if (!section) return;
+  const saved = state.data.activities
+    .filter(item => item.status === 'paused')
+    .sort((a, b) => Date.parse(b.pausedAt || b.updatedAt || b.createdAt) - Date.parse(a.pausedAt || a.updatedAt || a.createdAt));
+  section.classList.toggle('hidden', saved.length === 0);
+  $('#savedActivitiesCount').textContent = String(saved.length);
+  $('#savedActivitiesList').innerHTML = saved.map(activity => {
+    const questions = (activity.questionIds || []).map(questionById).filter(Boolean);
+    const answersByQuestion = new Map(state.data.answers.filter(answer => answer.activityId === activity.id).map(answer => [answer.questionId, answer]));
+    const answered = questions.filter(question => responseIsComplete(question, answersByQuestion.get(question.id)?.response)).length;
+    const partial = questions.filter(question => {
+      const response = answersByQuestion.get(question.id)?.response;
+      return response != null && String(response).trim() !== '' && !responseIsComplete(question, response);
+    }).length;
+    const total = questions.length;
+    const started = answered + partial;
+    const percentage = total ? Math.round(started / total * 100) : 0;
+    const lastSaved = activity.pausedAt || activity.updatedAt || activity.createdAt;
+    const progressLabel = `${answered} respondidas${partial ? ` · ${partial} parciais` : ''} · ${Math.max(0, total - started)} restantes`;
+    return `<article class="saved-activity-item"><div class="saved-activity-main"><div class="saved-activity-heading"><b>${escapeHTML(activity.title || 'Atividade sem título')}</b><span class="saved-activity-status">Salva</span></div><div class="saved-activity-meta"><span>${progressLabel} (${total} questões)</span><span>Salva em ${formatDate(lastSaved, true)}</span></div><div class="saved-activity-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentage}"><i style="width:${percentage}%"></i></div></div><div class="saved-activity-actions"><button class="button small primary" data-action="resume-activity" data-id="${safeAttr(activity.id)}">Continuar</button><button class="button small secondary" data-action="delete-saved-activity" data-id="${safeAttr(activity.id)}">Excluir</button></div></article>`;
+  }).join('');
+}
+
 function renderActivityBuilder() {
+  renderPendingTasks();
+  renderSavedActivities();
   if (state.currentActivity?.status === 'running') {
+    $('#pendingTaskSection')?.classList.add('hidden');
+    $('#savedActivitiesSection')?.classList.add('hidden');
     $('.activity-layout').classList.add('hidden');
     $('#activityNoQuestions').classList.add('hidden');
     $('#activitySession').classList.remove('hidden');
@@ -193,17 +457,83 @@ function renderActivityBuilder() {
   $('#activitySession').classList.add('hidden');
   const available = eligibleQuestions();
   $('#eligibleCount').textContent = `${available.length} ${available.length === 1 ? 'questão elegível' : 'questões elegíveis'}`;
-  $('#eligibleHint').textContent = available.length ? 'A quantidade será ajustada ao número disponível.' : 'Amplie os filtros ou importe questões para começar.';
+  $('#eligibleHint').textContent = '';
   $('#createActivity').disabled = available.length === 0;
   $('#activityNoQuestions').classList.toggle('hidden', state.data.questions.length > 0);
-  const topics = [...new Set(state.data.questions.flatMap(q => [q.primaryTopic, ...(q.secondaryTopics || []), ...(q.subtopics || [])]).filter(Boolean))].sort((a,b) => a.localeCompare(b));
-  $('#topicSuggestions').innerHTML = topics.map(topic => `<option value="${escapeHTML(topic)}"></option>`).join('');
-  fillSubjectSelect($('#activitySubject'), $('#activityArea').value);
+  $('#activityAreaFilters').innerHTML = Object.keys(SUBJECTS).map(area => `<button type="button" class="filter-chip ${state.activityFilters.areas.includes(area) ? 'selected' : ''}" data-activity-area="${safeAttr(area)}" aria-pressed="${state.activityFilters.areas.includes(area)}">${escapeHTML(area)}</button>`).join('');
+  $('#activitySubjectFilters').innerHTML = Object.values(SUBJECTS).flat().map(subject => `<button type="button" class="filter-chip ${state.activityFilters.subjects.includes(subject) ? 'selected' : ''}" data-activity-subject="${safeAttr(subject)}" aria-pressed="${state.activityFilters.subjects.includes(subject)}">${escapeHTML(subject)}</button>`).join('');
+  const picker = $('#activityTopicPicker');
+  if (picker) picker.classList.toggle('hidden', !state.activityTopicPickerOpen);
+  const toggle = $('#toggleActivityTopicPicker');
+  if (toggle) toggle.setAttribute('aria-expanded', String(state.activityTopicPickerOpen));
+  const search = $('#activityTopicSearch');
+  if (search && search.value !== state.activityTopicSearch) search.value = state.activityTopicSearch;
+  $('#selectedActivityTopics').innerHTML = state.activityFilters.topics.map(topic => `<button type="button" class="selected-topic" data-remove-activity-topic="${safeAttr(topic)}"><span>${escapeHTML(topic)}</span><b aria-hidden="true">×</b></button>`).join('');
+  renderActivityTopicList();
   const correctionAtEnd = $('#correctionMode').value === 'end';
   $('#showErrors').disabled = correctionAtEnd;
   if (correctionAtEnd) $('#showErrors').checked = false;
   $('#timerMinutes').disabled = !$('#timerEnabled').checked;
   $('#timerDurationRow').style.opacity = $('#timerEnabled').checked ? '1' : '.55';
+}
+function toggleActivityTopic(value, checked = null) {
+  const topic = String(value || '').trim();
+  if (!topic) return;
+  const normalized = normalizeSearch(topic);
+  const exists = state.activityFilters.topics.some(item => normalizeSearch(item) === normalized);
+  const shouldAdd = checked == null ? !exists : Boolean(checked);
+  if (shouldAdd && !exists) state.activityFilters.topics.push(topic);
+  if (!shouldAdd && exists) state.activityFilters.topics = state.activityFilters.topics.filter(item => normalizeSearch(item) !== normalized);
+  $('#selectedActivityTopics').innerHTML = state.activityFilters.topics.map(item => `<button type="button" class="selected-topic" data-remove-activity-topic="${safeAttr(item)}"><span>${escapeHTML(item)}</span><b aria-hidden="true">×</b></button>`).join('');
+  renderActivityTopicList();
+  renderEligibleActivityCount();
+}
+async function saveCustomActivityTopic(value) {
+  const label = String(value || '').trim().replace(/\s+/g, ' ');
+  if (!label) return;
+  const normalized = normalizeSearch(label);
+  if (!normalized) return;
+  const existingCatalogItem = buildActivityTopicCatalog().find(item => item.normalized === normalized);
+  if (existingCatalogItem) {
+    state.activityTopicSearch = '';
+    const search = $('#activityTopicSearch'); if (search) search.value = '';
+    toggleActivityTopic(existingCatalogItem.label, true);
+    renderActivityTopicList();
+    return;
+  }
+  const existing = (state.data.topics || []).find(item => isCustomTopic(item) && item.normalized === normalized);
+  const selectedSubjects = state.activityFilters.subjects;
+  const selectedAreas = new Set(state.activityFilters.areas);
+  for (const subject of selectedSubjects) if (SUBJECT_AREAS[subject]) selectedAreas.add(SUBJECT_AREAS[subject]);
+  const subjects = [...new Set([...(existing?.subjects || []), ...selectedSubjects])];
+  const areas = [...new Set([...(existing?.areas || []), ...selectedAreas])];
+  const stamp = nowISO();
+  const record = {
+    ...(existing || {}),
+    id: existing?.id || `custom-${normalized}`,
+    normalized,
+    label: existing?.label || label,
+    custom: true,
+    source: 'custom',
+    subjects,
+    areas,
+    createdAt: existing?.createdAt || stamp,
+    updatedAt: stamp
+  };
+  await putRecord(state.db, 'topics', record);
+  state.data.topics = [...(state.data.topics || []).filter(item => item.id !== record.id), record];
+  activityTopicCache = { questions: null, topics: null, items: [], counts: new Map() };
+  state.activityTopicSearch = '';
+  const search = $('#activityTopicSearch'); if (search) search.value = '';
+  toggleActivityTopic(record.label, true);
+  renderActivityTopicList();
+  toast('Assunto personalizado salvo.');
+}
+function renderEligibleActivityCount() {
+  const available = eligibleQuestions();
+  $('#eligibleCount').textContent = `${available.length} ${available.length === 1 ? 'questão elegível' : 'questões elegíveis'}`;
+  $('#eligibleHint').textContent = '';
+  $('#createActivity').disabled = available.length === 0;
 }
 
 function getQuestionAmount(availableCount) {
@@ -213,6 +543,17 @@ function getQuestionAmount(availableCount) {
 }
 function randomize(items) { const list = [...items]; for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; } return list; }
 async function makeActivity() {
+  const storedActivities = await getAll(state.db, 'activities');
+  state.data.activities = storedActivities;
+  const alreadyRunning = storedActivities.filter(item => item.status === 'running').sort((a,b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))[0];
+  if (alreadyRunning) {
+    state.currentActivity = alreadyRunning;
+    await loadActivityAnswers(alreadyRunning.id);
+    pageNavigate('activity');
+    startActivityTimer();
+    toast('Há uma atividade em andamento. Retome-a antes de iniciar outra.');
+    return;
+  }
   const candidates = eligibleQuestions();
   if (!candidates.length) return toast('Não há questões elegíveis com esses filtros.');
   const amount = getQuestionAmount(candidates.length);
@@ -236,15 +577,17 @@ async function makeActivity() {
   if (!selected.length) return toast('Não foi possível montar a atividade.');
   const activity = {
     id: makeId('activity'), title: `Atividade · ${new Date().toLocaleDateString('pt-BR')}`,
-    questionIds: selected.map(q => q.id), status: 'running', createdAt: nowISO(), startedAt: nowISO(),
+    questionIds: selected.map(q => q.id), status: 'running', createdAt: nowISO(), startedAt: nowISO(), activeSince: nowISO(), elapsedSecs: 0,
     config: {
       correctionMode: $('#correctionMode').value, showErrors: $('#showErrors').checked,
       commentMode: $('#commentMode').value, navigationMode: $('#navigationMode').value,
       timerEnabled: $('#timerEnabled').checked, timerMinutes: Math.min(600, Math.max(1, Number($('#timerMinutes').value) || 90)),
-      negativeScoring: $('#negativeScoring').checked, strategy
+      negativeScoring: $('#negativeScoring').checked, strategy,
+      filters: { areas: [...state.activityFilters.areas], subjects: [...state.activityFilters.subjects], topics: [...state.activityFilters.topics], difficulty: $('#activityDifficulty').value }
     }
   };
   await putRecord(state.db, 'activities', activity);
+  state.data.activities = [...state.data.activities.filter(item => item.id !== activity.id), activity];
   state.currentActivity = activity;
   state.activityAnswers = new Map();
   state.activityStart = Date.now();
@@ -252,17 +595,18 @@ async function makeActivity() {
 }
 
 async function loadActivityAnswers(activityId) {
-  // Read the persistent source of truth; the UI cache may be stale while an activity is open.
-  const allAnswers = await getAll(state.db, 'answers');
-  state.data.answers = allAnswers;
-  const answers = allAnswers.filter(answer => answer.activityId === activityId);
+  const answers = state.data.answers.filter(answer => answer.activityId === activityId);
   state.activityAnswers = new Map(answers.map(answer => [answer.questionId, answer]));
 }
 function syncAnswerCache(record) {
   state.activityAnswers.set(record.questionId, record);
-  const index = state.data.answers.findIndex(item => item.id === record.id);
-  if (index >= 0) state.data.answers[index] = record;
-  else state.data.answers.push(record);
+  if (answerMapSource !== state.data.answers) {
+    answerMapSource = state.data.answers;
+    answerByIdMap = new Map(answerMapSource.map(answer => [answer.id, answer]));
+  }
+  const old = answerByIdMap.get(record.id);
+  if (old) Object.assign(old, record);
+  else { state.data.answers.push(record); answerByIdMap.set(record.id, record); }
 }
 function getResponseFromQuestion(questionId, question) {
   const card = document.querySelector(`[data-question-card="${CSS.escape(questionId)}"]`);
@@ -294,33 +638,92 @@ function responseIsCorrect(question, response) {
 function answerCount(questionId) { const answer = state.activityAnswers.get(questionId); const question = questionById(questionId); return question && responseIsComplete(question, answer?.response) ? 1 : 0; }
 function renderSingleImage(question, image) {
   const metadata = state.data.assets.find(item => item.id === image.assetId);
-  if (!metadata) return `<figure><div class="empty-inline"><b>Imagem indisponível</b><small>${escapeHTML(image.alt || image.assetId)}</small></div></figure>`;
-  return `<figure><img data-asset-id="${safeAttr(image.assetId)}" alt="${safeAttr(image.alt || image.caption || 'Imagem da questão')}" loading="lazy">${image.caption ? `<figcaption>${escapeHTML(image.caption)}</figcaption>` : ''}</figure>`;
+  if (!metadata) return `<figure><div class="empty-inline"><b>Imagem indisponível</b><small>${escapeHTML(image.alt || image.assetId)}</small></div>${renderExternalReference(image.sourceUrl, image.sourceLabel || 'Abrir imagem original')}</figure>`;
+  return `<figure><img data-asset-id="${safeAttr(image.assetId)}" alt="${safeAttr(image.alt || image.caption || 'Imagem da questão')}" loading="lazy">${image.caption ? `<figcaption>${escapeHTML(image.caption)}</figcaption>` : ''}${renderExternalReference(image.sourceUrl, image.sourceLabel || 'Ver origem da imagem')}</figure>`;
+}
+async function loadAssetImage(element) {
+  const id = element.dataset.assetId;
+  if (!id || !element.isConnected) return;
+  if (state.assetUrls.has(id)) { element.src = state.assetUrls.get(id); return; }
+  let pending = assetLoadPromises.get(id);
+  if (!pending) {
+    pending = (async () => {
+      const stored = await getOne(state.db, 'assetBlobs', id);
+      if (!stored?.blob) return null;
+      const metadata = state.data.assets.find(item => item.id === id);
+      const typed = stored.blob.type ? stored.blob : stored.blob.slice(0, stored.blob.size, stored.type || metadata?.mimeType || 'application/octet-stream');
+      const url = URL.createObjectURL(typed);
+      state.assetUrls.set(id, url);
+      return url;
+    })();
+    assetLoadPromises.set(id, pending);
+  }
+  try {
+    const url = await pending;
+    if (url && element.isConnected) element.src = url;
+    else if (!url && element.isConnected) element.alt = `${element.alt} (arquivo ausente)`;
+  } finally { assetLoadPromises.delete(id); }
+}
+function unobserveAssetImages(root) {
+  if (!assetImageObserver || !root) return;
+  $$('img[data-asset-id]', root).forEach(element => assetImageObserver.unobserve(element));
 }
 async function hydrateAssetImages(root = document) {
   const images = $$('img[data-asset-id]', root);
-  await Promise.all(images.map(async element => {
-    const id = element.dataset.assetId;
-    if (state.assetUrls.has(id)) { element.src = state.assetUrls.get(id); return; }
-    const stored = await getOne(state.db, 'assetBlobs', id);
-    if (!stored?.blob) { element.alt = `${element.alt} (arquivo ausente)`; return; }
-    const metadata = state.data.assets.find(item => item.id === id);
-    const typed = stored.blob.type ? stored.blob : stored.blob.slice(0, stored.blob.size, stored.type || metadata?.mimeType || 'application/octet-stream');
-    const url = URL.createObjectURL(typed);
-    state.assetUrls.set(id, url);
-    element.src = url;
-  }));
+  if (!images.length) return;
+  if ('IntersectionObserver' in window) {
+    assetImageObserver ||= new IntersectionObserver((entries, observer) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        observer.unobserve(entry.target);
+        loadAssetImage(entry.target).catch(error => { console.error(error); entry.target.alt = `${entry.target.alt} (falha ao carregar)`; });
+      }
+    }, { rootMargin: '420px 0px', threshold: 0.01 });
+    for (const element of images) {
+      const url = state.assetUrls.get(element.dataset.assetId);
+      if (url) element.src = url;
+      else assetImageObserver.observe(element);
+    }
+    return;
+  }
+  await Promise.all(images.map(element => loadAssetImage(element)));
+}
+function normalizeImagePosition(position, fallback = 'statement') {
+  return String(position || fallback).trim().toLowerCase().replace(/\s*:\s*/g, ':');
 }
 function renderQuestionImages(question, positions = null) {
   if (!question.images?.length) return '';
-  const allowed = positions ? new Set(positions) : null;
-  const selected = question.images.filter(image => !allowed || allowed.has(String(image.position || 'statement').toLowerCase()));
+  const allowed = positions ? new Set(positions.map(value => normalizeImagePosition(value))) : null;
+  const selected = question.images.filter(image => !allowed || allowed.has(normalizeImagePosition(image.position)));
   if (!selected.length) return '';
   return `<div class="question-assets">${selected.map(image => renderSingleImage(question, image)).join('')}</div>`;
 }
+const GENERAL_EXPLANATION_IMAGE_POSITIONS = ['explanation', 'after_explanation', 'general_explanation', 'resolution', 'resolucao'];
+function renderExplanationImages(question) {
+  return renderQuestionImages(question, GENERAL_EXPLANATION_IMAGE_POSITIONS);
+}
+function renderAlternativeExplanationImages(question, key) {
+  const letter = String(key || '').trim().toUpperCase();
+  if (!letter) return '';
+  return renderQuestionImages(question, [
+    `alternative_explanation:${letter}`,
+    `alternative-explanation:${letter}`,
+    `alternative_comment:${letter}`,
+    `alternative-comment:${letter}`
+  ]);
+}
+function getAlternativeExplanationText(question, key) {
+  const letter = String(key || '').trim().toUpperCase();
+  const explanations = question.alternativeExplanations || {};
+  return String(explanations[letter] ?? explanations[letter.toLowerCase()] ?? '').trim();
+}
+function hasExplanationContent(question) {
+  return Boolean(question.explanation || renderExplanationImages(question) || Object.keys(question.alternativeExplanations || {}).length ||
+    (question.images || []).some(image => /^(alternative[_-]explanation|alternative[_-]comment):/i.test(String(image.position || '').trim())));
+}
 function renderOptionImages(question, key) {
-  const normalized = [`option:${key}`, `alternative:${key}`, `alternativa:${key}`];
-  const items = question.images?.filter(image => normalized.includes(String(image.position || '').toLowerCase())) || [];
+  const normalized = [`option:${key}`, `alternative:${key}`, `alternativa:${key}`].map(value => value.toLowerCase());
+  const items = question.images?.filter(image => normalized.includes(normalizeImagePosition(image.position))) || [];
   return items.length ? `<div class="question-assets">${items.map(image => renderSingleImage(question, image)).join('')}</div>` : '';
 }
 function renderQuestionTables(question, positions = ['after_statement']) {
@@ -332,30 +735,128 @@ function renderQuestionEquations(question, positions = ['after_statement']) {
   return selected.map(item => `<div class="formula-panel">${item.label ? `<small>${escapeHTML(item.label)}</small>` : ''}<div>${escapeHTML(item.expression)}</div></div>`).join('');
 }
 
-function renderResponseOptions(question, current = '') {
+function renderResponseOptions(question, current = '', answerRecord = {}, config = null, final = false) {
   if (question.type === 'true_false') {
-    return `<div class="answer-options">${[['V','Verdadeiro'],['F','Falso']].map(([value,label]) => `<label class="answer-option"><input type="radio" name="answer-${safeAttr(question.id)}" value="${value}" ${current === value ? 'checked' : ''}><span><b>${value}</b> — ${label}</span></label>`).join('')}</div>`;
+    return `<div class="answer-options" id="options-q-${safeAttr(question.id)}">${[['V','Verdadeiro'],['F','Falso']].map(([value,label]) => `<label class="answer-option"><input type="radio" name="answer-${safeAttr(question.id)}" value="${value}" ${current === value ? 'checked' : ''}><span><b>${value}</b> — ${label}</span></label>`).join('')}</div>`;
   }
   if (question.type === 'assertion_set') {
     const chars = String(current || '').split('');
-    return `<div class="answer-options">${question.statements.map((item,index) => `<label class="statement-answer"><span><b>${index + 1}.</b> ${richText(item.text)}</span><select data-statement-index="${index}" aria-label="Resposta da afirmação ${index + 1}"><option value="">Selecione</option><option value="V" ${chars[index] === 'V' ? 'selected' : ''}>Verdadeiro</option><option value="F" ${chars[index] === 'F' ? 'selected' : ''}>Falso</option></select></label>`).join('')}</div>`;
+    return `<div class="answer-options" id="options-q-${safeAttr(question.id)}">${question.statements.map((item,index) => `<label class="statement-answer"><span><b>${index + 1}.</b> ${richText(item.text)}</span><select data-statement-index="${index}" aria-label="Resposta da afirmação ${index + 1}"><option value="">Selecione</option><option value="V" ${chars[index] === 'V' ? 'selected' : ''}>Verdadeiro</option><option value="F" ${chars[index] === 'F' ? 'selected' : ''}>Falso</option></select></label>`).join('')}</div>`;
   }
-  return `<div class="answer-options">${Object.entries(question.alternatives || {}).map(([key,value]) => `<label class="answer-option"><input type="radio" name="answer-${safeAttr(question.id)}" value="${safeAttr(key)}" ${String(current).toUpperCase() === key ? 'checked' : ''}><span class="option-content"><b>${escapeHTML(key)})</b> ${richText(value)}${renderOptionImages(question,key)}</span></label>`).join('')}</div>`;
+  const dimmed = new Set(answerRecord?.dimmedOptions || answerRecord?.eliminatedOptions || []);
+  const canShowComment = final ? config?.commentMode !== 'hidden' : config?.commentMode === 'available' && config?.correctionMode === 'immediate';
+  const selectedKey = String(current || '').trim().toUpperCase();
+  const isComplete = responseIsComplete(question, current);
+  const isCorrect = isComplete && responseIsCorrect(question, current);
+  return `<div class="answer-options" id="options-q-${safeAttr(question.id)}">${Object.entries(question.alternatives || {}).map(([key,value]) => {
+    const selected = selectedKey === key.toUpperCase();
+    const isDimmed = dimmed.has(key) || dimmed.has(String(key).toUpperCase());
+    const specificComment = selected && canShowComment && isComplete ? getAlternativeExplanationText(question, key) : '';
+    const specificImages = selected && canShowComment && isComplete ? renderAlternativeExplanationImages(question, key) : '';
+    const hasSpecificComment = Boolean(specificComment || specificImages);
+    return `<div class="answer-option-row"><label class="answer-option ${isDimmed ? 'dimmed' : ''}" data-hold-option="${safeAttr(key)}" data-question-option="${safeAttr(question.id)}" aria-label="Alternativa ${escapeHTML(key)}"><input type="radio" name="answer-${safeAttr(question.id)}" value="${safeAttr(key)}" ${selected ? 'checked' : ''}><span class="option-content"><b>${escapeHTML(key)})</b> ${richText(value)}${renderOptionImages(question,key)}</span></label>${hasSpecificComment ? `<div class="alternative-comment ${isCorrect ? 'correct' : 'wrong'}"><b>${isCorrect ? 'Comentário da alternativa marcada' : `Por que a alternativa ${escapeHTML(key)} está incorreta`}</b>${specificComment ? `<p>${richText(specificComment)}</p>` : ''}${specificImages}</div>` : ''}</div>`;
+  }).join('')}</div>`;
 }
+
 function renderQuestionFeedback(question, answer, config, final = false) {
   if (!answer?.response || !responseIsComplete(question, answer.response)) return '';
   const reveal = final || (config.correctionMode === 'immediate' && config.showErrors);
   const showComment = final ? config.commentMode !== 'hidden' : config.commentMode === 'available' && config.correctionMode === 'immediate';
-  if (!reveal && !showComment) return '';
+  const explanationImages = showComment ? renderExplanationImages(question) : '';
+  const hasExplanation = Boolean(showComment && (question.explanation || explanationImages));
+  if (!reveal && !hasExplanation) return '';
   const correct = responseIsCorrect(question, answer.response);
   const expected = getExpectedAnswer(question);
   const answerLabel = question.type === 'multiple_choice' ? `${expected}) ${question.alternatives?.[expected] || ''}` : expected;
   const kind = correct ? 'correct' : 'wrong';
-  const explanation = showComment && question.explanation ? `<p>${richText(question.explanation)}</p>` : '';
-  const alternatives = showComment && question.alternativeExplanations && Object.keys(question.alternativeExplanations).length ? (final ? `<div>${Object.entries(question.alternativeExplanations).map(([key,value]) => `<p><b>${escapeHTML(key)}:</b> ${richText(value)}</p>`).join('')}</div>` : (() => { const selected = question.type === 'multiple_choice' ? String(answer.response).toUpperCase() : ''; const comment = question.alternativeExplanations[selected]; return comment ? `<p><b>Comentário da alternativa ${escapeHTML(selected)}:</b> ${richText(comment)}</p>` : ''; })()) : '';
-  if (!reveal && !explanation && !alternatives) return '';
-  return `<div class="answer-feedback ${reveal ? kind : 'neutral'}">${reveal ? `<b>${correct ? 'Resposta correta' : 'Resposta incorreta'}</b> · Gabarito: ${escapeHTML(answerLabel)}` : '<b>Comentário disponível</b>'}${explanation}${alternatives}</div>`;
+  const explanation = showComment ? `${question.explanation ? `<p>${richText(question.explanation)}</p>` : ''}${explanationImages}` : '';
+  if (!reveal && !explanation) return '';
+  return `<div class="answer-feedback ${reveal ? kind : 'neutral'}">${reveal ? `<b>${correct ? 'Resposta correta' : 'Resposta incorreta'}</b> · Gabarito: ${escapeHTML(answerLabel)}` : '<b>Comentário disponível</b>'}${explanation}</div>`;
 }
+
+function navigationResponseLabel(question, response) {
+  if (response == null || response === '') return '';
+  const value = String(response).trim().toUpperCase();
+  if (question?.type === 'assertion_set') {
+    const cells = value.split('').map(letter => letter === 'V' || letter === 'F' ? letter : '·');
+    return cells.every(letter => letter === '·') ? '' : cells.join('');
+  }
+  if (question?.type === 'true_false') return value === 'V' || value === 'F' ? value : '';
+  return /^[A-Z]$/.test(value) ? value : '';
+}
+function updateNavigationAnswer(questionId) {
+  const button = document.querySelector(`.exam-number[data-jump="${CSS.escape(questionId)}"]`);
+  const question = questionById(questionId);
+  if (!button || !question) return;
+  const answer = state.activityAnswers.get(questionId);
+  const label = navigationResponseLabel(question, answer?.response);
+  const labelNode = button.querySelector('.exam-number-answer');
+  if (label) {
+    if (labelNode) labelNode.textContent = label;
+    else button.insertAdjacentHTML('beforeend', `<span class="exam-number-answer">${escapeHTML(label)}</span>`);
+    button.setAttribute('aria-label', `Questão ${button.querySelector('.exam-number-index')?.textContent || ''}, resposta marcada ${label}`);
+  } else {
+    labelNode?.remove();
+    button.setAttribute('aria-label', `Questão ${button.querySelector('.exam-number-index')?.textContent || ''}`);
+  }
+  button.classList.toggle('answered', responseIsComplete(question, answer?.response));
+  button.classList.toggle('review-mark', Boolean(answer?.markedForReview));
+}
+function keepNavigationItemVisible(button, behavior = 'smooth') {
+  const grid = $('#examNumberGrid');
+  if (!button || !grid) return;
+  const gridRect = grid.getBoundingClientRect();
+  const buttonRect = button.getBoundingClientRect();
+  const itemTop = buttonRect.top - gridRect.top + grid.scrollTop;
+  const itemBottom = itemTop + buttonRect.height;
+  const visibleTop = grid.scrollTop;
+  const visibleBottom = visibleTop + grid.clientHeight;
+  if (itemTop < visibleTop || itemBottom > visibleBottom) {
+    const nextTop = Math.max(0, itemTop - Math.max(0, (grid.clientHeight - button.offsetHeight) / 2));
+    grid.scrollTo({ top: nextTop, behavior });
+  }
+}
+function syncActivityNavigationFromScroll() {
+  activityNavigationFrame = null;
+  if (!state.currentActivity || state.currentActivity.status !== 'running' || state.page !== 'activity') return;
+  const cards = $$('[data-question-card]');
+  if (!cards.length) return;
+  const anchor = Math.min(Math.max(110, window.innerHeight * .24), 230);
+  let activeCard = cards.find(card => {
+    const rect = card.getBoundingClientRect();
+    return rect.bottom > anchor && rect.top < window.innerHeight;
+  });
+  if (!activeCard) activeCard = cards.find(card => card.getBoundingClientRect().bottom > 0) || cards[cards.length - 1];
+  const questionId = activeCard?.dataset.questionCard;
+  if (!questionId) return;
+  $$('.exam-number.current').forEach(button => button.classList.remove('current'));
+  const button = document.querySelector(`.exam-number[data-jump="${CSS.escape(questionId)}"]`);
+  if (button) {
+    button.classList.add('current');
+    keepNavigationItemVisible(button, 'auto');
+  }
+}
+function scheduleActivityNavigationSync() {
+  if (activityNavigationFrame != null) return;
+  activityNavigationFrame = requestAnimationFrame(syncActivityNavigationFromScroll);
+}
+function unbindActivityNavigationSync() {
+  if (activityNavigationScrollHandler) window.removeEventListener('scroll', activityNavigationScrollHandler);
+  if (activityNavigationResizeHandler) window.removeEventListener('resize', activityNavigationResizeHandler);
+  activityNavigationScrollHandler = null;
+  activityNavigationResizeHandler = null;
+  if (activityNavigationFrame != null) cancelAnimationFrame(activityNavigationFrame);
+  activityNavigationFrame = null;
+}
+function bindActivityNavigationSync() {
+  unbindActivityNavigationSync();
+  activityNavigationScrollHandler = scheduleActivityNavigationSync;
+  activityNavigationResizeHandler = scheduleActivityNavigationSync;
+  window.addEventListener('scroll', activityNavigationScrollHandler, { passive: true });
+  window.addEventListener('resize', activityNavigationResizeHandler, { passive: true });
+  scheduleActivityNavigationSync();
+}
+
 async function renderSession() {
   if (!state.currentActivity) return;
   const activity = state.currentActivity;
@@ -364,14 +865,21 @@ async function renderSession() {
   const answered = questions.filter(q => answerCount(q.id)).length;
   const html = `<div class="exam-shell"><div class="exam-top"><div><div class="eyebrow">ATIVIDADE EM ANDAMENTO</div><div class="exam-title">${escapeHTML(activity.title)}</div><div class="exam-meta">${questions.length} questões · Salvamento automático local</div></div><div class="exam-meta" id="activityTimerDisplay">${activity.config.timerEnabled ? '⏱ 00:00' : 'Sem cronômetro'}</div></div><div class="exam-progress"><i id="examProgressBar" style="width:${questions.length ? answered / questions.length * 100 : 0}%"></i></div><div class="exam-layout"><div class="exam-questions">${questions.map((q,index) => {
     const answer = state.activityAnswers.get(q.id);
-    const textBase = state.data.textBases.find(item => item.id === q.textBaseId);
-    return `<article class="glass-card exam-question" data-question-card="${safeAttr(q.id)}" id="exam-q-${safeAttr(q.id)}"><div class="exam-q-head"><b>Questão ${index + 1}</b><div class="question-meta"><span class="tag peach">${escapeHTML(q.subject || q.area)}</span><span class="tag">${q.explanation || Object.keys(q.alternativeExplanations || {}).length ? 'Comentada' : 'Gabarito'}</span><button class="icon-action ${answer?.markedForReview ? 'active' : ''}" data-action="mark-review" data-id="${safeAttr(q.id)}" title="Marcar para revisar">⚑</button></div></div>${textBase ? `<div class="base-text"><b>${escapeHTML(textBase.title || 'Texto-base')}</b><br>${richText(textBase.content)}</div>` : ''}${renderQuestionImages(q,['after_text_base','after-text-base'])}${renderQuestionTables(q,['after_text_base','after-text-base'])}${renderQuestionEquations(q,['after_text_base','after-text-base'])}${renderQuestionImages(q,['before_statement','before-statement'])}<div class="exam-stem">${richText(q.statement)}</div>${renderQuestionImages(q,['statement','enunciado','after_statement','after-statement'])}${renderQuestionTables(q,['statement','after_statement'])}${renderQuestionEquations(q,['statement','after_statement'])}${renderResponseOptions(q, answer?.response || '')}${renderQuestionImages(q,['after_alternatives','after-alternatives'])}${renderQuestionTables(q,['after_alternatives','after-alternatives'])}${renderQuestionEquations(q,['after_alternatives','after-alternatives'])}<div class="question-tools"><label class="confidence-select"><span>Como se sentiu?</span><select data-confidence="${safeAttr(q.id)}"><option value="unsure" ${answer?.confidence === 'unsure' || !answer?.confidence ? 'selected' : ''}>Com dúvida</option><option value="guess" ${answer?.confidence === 'guess' ? 'selected' : ''}>Chutei</option><option value="confident" ${answer?.confidence === 'confident' ? 'selected' : ''}>Confiante</option></select></label><span class="save-indicator" id="saved-${safeAttr(q.id)}">${answer?.response ? (responseIsComplete(q, answer.response) ? 'Resposta salva' : 'Resposta parcial salva') : 'Ainda não respondida'}</span></div><div id="feedback-${safeAttr(q.id)}">${renderQuestionFeedback(q, answer, activity.config)}</div></article>`;
-  }).join('')}</div><aside class="glass-card exam-side"><h3>Navegação</h3><div class="exam-number-grid">${questions.map((q,index) => `<button class="exam-number ${answerCount(q.id) ? 'answered' : ''} ${state.activityAnswers.get(q.id)?.markedForReview ? 'review-mark' : ''}" data-jump="${safeAttr(q.id)}" type="button">${index + 1}</button>`).join('')}</div><div class="fine-print">● Respondida · traço inferior: revisar</div><button class="button primary" data-action="finish-activity">Entregar atividade</button><button class="button secondary" data-action="exit-activity">Sair e continuar depois</button></aside></div><div class="exam-bottom"><span class="exam-meta" id="examAnsweredCount">${answered} de ${questions.length} respondidas</span><button class="text-button" data-action="finish-activity">Entregar atividade ↗</button></div></div>`;
+    const textBase = textBaseById(q.textBaseId);
+    return `<article class="glass-card exam-question" data-question-card="${safeAttr(q.id)}" id="exam-q-${safeAttr(q.id)}"><div class="exam-q-head"><b>Questão ${index + 1}</b><div class="question-meta"><span class="tag peach">${escapeHTML(q.subject || q.area)}</span><span class="tag">${hasExplanationContent(q) ? 'Comentada' : 'Gabarito'}</span><button class="icon-action ${answer?.markedForReview ? 'active' : ''}" data-action="mark-review" data-id="${safeAttr(q.id)}" title="Marcar para revisar">⚑</button></div></div>${textBase ? `<div class="base-text"><b>${escapeHTML(textBase.title || 'Texto-base')}</b><div class="base-content" data-textbase-for="${safeAttr(q.id)}">${richText(textBase.content)}</div></div>` : ''}${renderQuestionImages(q,['after_text_base','after-text-base'])}${renderQuestionTables(q,['after_text_base','after-text-base'])}${renderQuestionEquations(q,['after_text_base','after-text-base'])}${renderQuestionImages(q,['before_statement','before-statement'])}<div class="exam-stem" data-statement-for="${safeAttr(q.id)}">${questionStatementHTML(q.statement)}</div>${renderQuestionImages(q,['statement','enunciado','after_statement','after-statement'])}${renderQuestionTables(q,['statement','after_statement'])}${renderQuestionEquations(q,['statement','after_statement'])}${renderQuestionReferences(q)}${renderResponseOptions(q, answer?.response || '', answer, activity.config)}${renderQuestionImages(q,['after_alternatives','after-alternatives'])}${renderQuestionTables(q,['after_alternatives','after-alternatives'])}${renderQuestionEquations(q,['after_alternatives','after-alternatives'])}<div class="question-tools"><label class="confidence-select"><span>Como se sentiu?</span><select data-confidence="${safeAttr(q.id)}"><option value="unsure" ${answer?.confidence === 'unsure' || !answer?.confidence ? 'selected' : ''}>Com dúvida</option><option value="guess" ${answer?.confidence === 'guess' ? 'selected' : ''}>Chutei</option><option value="confident" ${answer?.confidence === 'confident' ? 'selected' : ''}>Confiante</option></select></label><span class="save-indicator" id="saved-${safeAttr(q.id)}">${answer?.response ? (responseIsComplete(q, answer.response) ? 'Resposta salva' : 'Resposta parcial salva') : 'Ainda não respondida'}</span></div><div id="feedback-${safeAttr(q.id)}">${renderQuestionFeedback(q, answer, activity.config)}</div></article>`;
+  }).join('')}</div><aside class="glass-card exam-side"><h3>Navegação</h3><div class="exam-number-grid" id="examNumberGrid">${questions.map((q,index) => { const answer = state.activityAnswers.get(q.id); const navAnswer = navigationResponseLabel(q, answer?.response); return `<button class="exam-number ${answerCount(q.id) ? 'answered' : ''} ${answer?.markedForReview ? 'review-mark' : ''}" data-jump="${safeAttr(q.id)}" type="button" aria-label="Questão ${index + 1}${navAnswer ? `, resposta marcada ${safeAttr(navAnswer)}` : ''}"><span class="exam-number-index">${index + 1}</span>${navAnswer ? `<span class="exam-number-answer">${escapeHTML(navAnswer)}</span>` : ''}</button>`; }).join('')}</div><button class="button primary" data-action="finish-activity">Entregar atividade</button><button class="button secondary" data-action="exit-activity">Salvar e sair</button><button class="button danger" data-action="discard-activity">Descartar e criar outra</button></aside></div><div class="exam-bottom"><span class="exam-meta" id="examAnsweredCount">${answered} de ${questions.length} respondidas</span><button class="text-button" data-action="finish-activity">Entregar atividade ↗</button></div><div id="textSelectionToolbar" class="text-selection-toolbar hidden"><button type="button" data-action="toggle-text-highlight">Grifar trecho</button></div></div>`;
+  unobserveAssetImages($('#activitySession'));
   $('#activitySession').innerHTML = html;
   $('.activity-layout').classList.add('hidden');
   $('#activityNoQuestions').classList.add('hidden');
   $('#activitySession').classList.remove('hidden');
   await hydrateAssetImages($('#activitySession'));
+  for (const question of questions) {
+    const marks = state.activityAnswers.get(question.id)?.highlights || [];
+    applyTextMarks($(`[data-statement-for="${CSS.escape(question.id)}"]`), marks, 'statement');
+    applyTextMarks($(`[data-textbase-for="${CSS.escape(question.id)}"]`), marks, 'textBase');
+  }
+  bindActivityNavigationSync();
   if (activity.config.timerEnabled) updateTimerLabel();
 }
 async function saveQuestionResponse(questionId) {
@@ -381,7 +889,7 @@ async function saveQuestionResponse(questionId) {
   const response = getResponseFromQuestion(questionId, question);
   const complete = responseIsComplete(question, response);
   const record = {
-    id: `${state.currentActivity.id}::${questionId}`, activityId: state.currentActivity.id,
+    ...previous, id: `${state.currentActivity.id}::${questionId}`, activityId: state.currentActivity.id,
     questionId, response, confidence: previous.confidence || 'unsure', markedForReview: previous.markedForReview || false,
     answeredAt: complete ? nowISO() : null, isCorrect: complete ? responseIsCorrect(question, response) : null,
     updatedAt: nowISO()
@@ -390,18 +898,17 @@ async function saveQuestionResponse(questionId) {
   syncAnswerCache(record);
   const card = document.querySelector(`[data-question-card="${CSS.escape(questionId)}"]`);
   if (!card) return;
+  const options = $('#options-q-' + CSS.escape(questionId));
+  if (options) options.outerHTML = renderResponseOptions(question, record.response || '', record, state.currentActivity.config);
   const feedback = $('#feedback-' + CSS.escape(questionId));
   if (feedback) feedback.innerHTML = renderQuestionFeedback(question, record, state.currentActivity.config);
+  await hydrateAssetImages(card);
   const saved = $('#saved-' + CSS.escape(questionId));
   if (saved) saved.textContent = response ? (complete ? 'Resposta salva automaticamente' : 'Resposta parcial salva automaticamente') : 'Ainda não respondida';
-  const count = state.currentActivity.questionIds.filter(id => answerCount(id)).length;
+  const count = state.currentActivity.questionIds.reduce((total, id) => total + answerCount(id), 0);
   $('#examAnsweredCount').textContent = `${count} de ${state.currentActivity.questionIds.length} respondidas`;
   $('#examProgressBar').style.width = `${count / state.currentActivity.questionIds.length * 100}%`;
-  $$('.exam-number').forEach(button => {
-    const id = button.dataset.jump;
-    button.classList.toggle('answered', Boolean(answerCount(id)));
-    button.classList.toggle('review-mark', Boolean(state.activityAnswers.get(id)?.markedForReview));
-  });
+  updateNavigationAnswer(questionId);
 }
 async function setConfidence(questionId, confidence) {
   const old = state.activityAnswers.get(questionId) || { id: `${state.currentActivity.id}::${questionId}`, activityId: state.currentActivity.id, questionId, response: '' };
@@ -416,24 +923,35 @@ async function toggleReviewMark(questionId) {
   syncAnswerCache(next);
   const button = document.querySelector(`[data-action="mark-review"][data-id="${CSS.escape(questionId)}"]`);
   if (button) button.classList.toggle('active', next.markedForReview);
-  $$('.exam-number').forEach(item => { if (item.dataset.jump === questionId) item.classList.toggle('review-mark', next.markedForReview); });
+  const navButton = document.querySelector(`.exam-number[data-jump="${CSS.escape(questionId)}"]`);
+  if (navButton) navButton.classList.toggle('review-mark', next.markedForReview);
+}
+function activityElapsedSeconds(activity, now = Date.now()) {
+  if (!activity) return 0;
+  const hasStoredElapsed = Number.isFinite(Number(activity.elapsedSecs));
+  const accumulated = hasStoredElapsed ? Math.max(0, Number(activity.elapsedSecs)) : 0;
+  const activeSince = activity.activeSince || (!hasStoredElapsed && activity.status === 'running' ? activity.startedAt : null);
+  return accumulated + (activeSince ? timeAgoSeconds(activeSince, now) : 0);
 }
 function startActivityTimer() {
   clearInterval(state.activityTimer);
   if (!state.currentActivity?.config.timerEnabled) return;
-  state.activityStart = Date.parse(state.currentActivity.startedAt) || Date.now();
-  state.activityTimer = setInterval(() => {
-    const limit = state.currentActivity.config.timerMinutes * 60;
-    const remaining = limit - timeAgoSeconds(state.activityStart);
+  state.activityStart = Date.parse(state.currentActivity.activeSince || state.currentActivity.startedAt) || Date.now();
+  const tick = () => {
+    if (!state.currentActivity || state.currentActivity.status !== 'running') { clearInterval(state.activityTimer); return; }
+    const limit = Math.max(1, Number(state.currentActivity.config.timerMinutes) || 90) * 60;
+    const remaining = limit - activityElapsedSeconds(state.currentActivity);
     updateTimerLabel(remaining);
     if (remaining <= 0) { clearInterval(state.activityTimer); finishActivity(true).catch(error => { state.finishingActivityId = null; console.error(error); toast('Não foi possível concluir a atividade automaticamente. Suas respostas continuam salvas.', 6000); }); }
-  }, 1000);
+  };
+  tick();
+  state.activityTimer = setInterval(tick, 1000);
 }
 function updateTimerLabel(remaining = null) {
   const element = $('#activityTimerDisplay');
   if (!element || !state.currentActivity?.config.timerEnabled) return;
-  const total = state.currentActivity.config.timerMinutes * 60;
-  const left = remaining == null ? Math.max(0, total - timeAgoSeconds(state.activityStart || state.currentActivity.startedAt)) : remaining;
+  const total = Math.max(1, Number(state.currentActivity.config.timerMinutes) || 90) * 60;
+  const left = remaining == null ? Math.max(0, total - activityElapsedSeconds(state.currentActivity)) : remaining;
   const h = Math.floor(left / 3600); const m = Math.floor(left % 3600 / 60); const s = Math.floor(left % 60);
   element.textContent = `⏱ ${h ? `${String(h).padStart(2,'0')}:` : ''}${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 }
@@ -448,6 +966,9 @@ async function finishActivity(timeExpired = false) {
   const questions = activity.questionIds.map(questionById).filter(Boolean);
   await loadActivityAnswers(activity.id);
   const responseRecords = [];
+  const answerUpdates = [];
+  const reviewUpdates = [];
+  const pendingReviewsByQuestion = new Map(state.data.reviews.filter(item => item.status !== 'completed').map(item => [item.questionId, item]));
   let correct = 0; let wrong = 0; let blank = 0; let netScore = 0;
   for (const question of questions) {
     const answer = state.activityAnswers.get(question.id) || { response: '', confidence: 'unsure', markedForReview: false };
@@ -462,26 +983,31 @@ async function finishActivity(timeExpired = false) {
       if (count > 1) netScore -= 1 / (count - 1);
     }
     const updated = { ...answer, id: `${activity.id}::${question.id}`, activityId: activity.id, questionId: question.id, isCorrect: hasResponse ? isCorrect : null, completedAt: nowISO(), updatedAt: nowISO() };
-    await putRecord(state.db, 'answers', updated);
+    answerUpdates.push(updated);
     state.activityAnswers.set(question.id, updated);
-    const oldReview = state.data.reviews.find(item => item.questionId === question.id && item.status !== 'completed');
+    const oldReview = pendingReviewsByQuestion.get(question.id);
     if (hasResponse && isCorrect && answer.confidence === 'confident' && !answer.markedForReview && oldReview) {
-      await putRecord(state.db, 'reviews', { ...oldReview, status: 'completed', completedAt: nowISO(), updatedAt: nowISO() });
+      reviewUpdates.push({ ...oldReview, status: 'completed', completedAt: nowISO(), updatedAt: nowISO() });
     } else if ((hasResponse && (!isCorrect || answer.confidence !== 'confident')) || answer.markedForReview) {
-      const days = !isCorrect ? 1 : answer.confidence === 'guess' ? 2 : 4;
-      const review = { id: oldReview?.id || makeId('review'), questionId: question.id, sourceActivityId: activity.id, status: 'pending', reason: !isCorrect ? 'Resposta incorreta' : answer.markedForReview ? 'Marcada durante a atividade' : 'Resposta com baixa confiança', dueAt: new Date(Date.now() + days * 86400000).toISOString(), createdAt: oldReview?.createdAt || nowISO(), updatedAt: nowISO() };
-      await putRecord(state.db, 'reviews', review);
+      const days = !hasResponse ? 1 : !isCorrect ? 1 : answer.confidence === 'guess' ? 2 : 4;
+      const reason = !hasResponse ? 'Marcada durante a atividade' : !isCorrect ? 'Resposta incorreta' : answer.markedForReview ? 'Marcada durante a atividade' : 'Resposta com baixa confiança';
+      const review = { id: oldReview?.id || makeId('review'), questionId: question.id, sourceActivityId: activity.id, status: 'pending', reason, dueAt: new Date(Date.now() + days * 86400000).toISOString(), createdAt: oldReview?.createdAt || nowISO(), updatedAt: nowISO() };
+      reviewUpdates.push(review);
     }
     responseRecords.push({ question, answer: updated, isCorrect, hasResponse });
   }
-  const durationSecs = timeAgoSeconds(activity.startedAt, Date.now());
+  await writeBatch(state.db, { answers: answerUpdates, ...(reviewUpdates.length ? { reviews: reviewUpdates } : {}) });
+  const durationSecs = activityElapsedSeconds(activity);
+  const resultRecords = responseRecords.map(item => ({ question: item.question, hasResponse: item.hasResponse, isCorrect: item.isCorrect }));
+  const triEstimate = estimateTriTheta(resultRecords);
+  const difficultyConsistency = calculateDifficultyConsistency(resultRecords);
   const result = {
     total: questions.length, answered: correct + wrong, correct, wrong, blank,
     percentage: questions.length ? Math.round(correct / questions.length * 100) : 0,
     netScore: Number(netScore.toFixed(3)), rawScore: correct,
-    durationSecs, timeExpired, finishedAt: nowISO()
+    triEstimate, difficultyConsistency, durationSecs, timeExpired, finishedAt: nowISO()
   };
-  const completed = { ...activity, status: 'completed', endedAt: nowISO(), durationSecs, result, updatedAt: nowISO() };
+  const completed = { ...activity, status: 'completed', activeSince: null, elapsedSecs: durationSecs, endedAt: nowISO(), durationSecs, result, updatedAt: nowISO() };
   await putRecord(state.db, 'activities', completed);
   state.currentActivity = completed;
   await refreshData();
@@ -489,19 +1015,46 @@ async function finishActivity(timeExpired = false) {
   await renderResult(completed);
 }
 async function renderResult(activity) {
+  unbindActivityNavigationSync();
   const questions = activity.questionIds.map(questionById).filter(Boolean);
   await loadActivityAnswers(activity.id);
   const result = activity.result || {};
-  $('#activitySession').innerHTML = `<div class="exam-shell"><div class="exam-top"><div><div class="eyebrow">RESULTADO DA ATIVIDADE</div><div class="exam-title">${escapeHTML(activity.title)}</div><div class="exam-meta">Concluída em ${formatDate(activity.endedAt, true)} · ${durationLabel(result.durationSecs)}</div></div><button class="button secondary" data-action="new-activity">Nova atividade</button></div><article class="glass-card result-hero"><div class="eyebrow">APROVEITAMENTO</div><div class="result-score"><strong>${result.percentage ?? 0}%</strong><span>${result.correct ?? 0} acertos de ${result.total ?? 0} questões</span></div><div class="metric-row"><div class="metric"><strong>${result.wrong ?? 0}</strong><span>erros</span></div><div class="metric"><strong>${result.blank ?? 0}</strong><span>em branco</span></div><div class="metric"><strong>${Number(result.netScore ?? 0).toFixed(2).replace('.', ',')}</strong><span>pontuação líquida</span></div><div class="metric"><strong>${durationLabel(result.durationSecs)}</strong><span>tempo</span></div></div></article><div class="eyebrow">REVISÃO DAS RESPOSTAS</div><div style="height:10px"></div><div>${questions.map((q,index) => {
+  const activityRecords = activityPerformanceRecords(activity);
+  const renderResultBreakdown = keyGetter => {
+    const map = new Map();
+    activityRecords.forEach(record => {
+      const key = keyGetter(record.question) || 'Não informada';
+      const item = map.get(key) || { total: 0, answered: 0, correct: 0, blank: 0 };
+      item.total++;
+      if (record.hasResponse) { item.answered++; if (record.isCorrect) item.correct++; }
+      else item.blank++;
+      map.set(key,item);
+    });
+    return [...map.entries()].sort((a,b)=>b[1].total-a[1].total || a[0].localeCompare(b[0],'pt-BR')).map(([name,item]) => `<div class="result-breakdown-row"><span><b>${escapeHTML(name)}</b><small>${item.correct}/${item.answered} acertos · ${item.blank} em branco · ${item.total} questões</small></span><strong>${item.answered ? `${Math.round(item.correct/item.answered*100)}%` : '—'}</strong></div>`).join('');
+  };
+  const resultBreakdown = `<section class="glass-card result-breakdown"><div class="eyebrow">DIAGNÓSTICO DA ATIVIDADE</div><div class="result-breakdown-grid"><div><h3>Por matéria</h3>${renderResultBreakdown(question=>question.subject||question.area)}</div><div><h3>Por dificuldade</h3>${renderResultBreakdown(question=>question.difficulty||'Sem nível')}</div></div></section>`;
+  $('#activitySession').innerHTML = `<div class="exam-shell"><div class="exam-top"><div><div class="eyebrow">RESULTADO DA ATIVIDADE</div><div class="exam-title">${escapeHTML(activity.title)}</div><div class="exam-meta">Concluída em ${formatDate(activity.endedAt, true)} · ${durationLabel(result.durationSecs)}</div></div><button class="button secondary" data-action="new-activity">Nova atividade</button></div><article class="glass-card result-hero"><div class="eyebrow">APROVEITAMENTO</div><div class="result-score"><strong>${result.percentage ?? 0}%</strong><span>${result.correct ?? 0} acertos de ${result.total ?? 0} questões</span></div><div class="metric-row"><div class="metric"><strong>${result.wrong ?? 0}</strong><span>erros</span></div><div class="metric"><strong>${result.blank ?? 0}</strong><span>em branco</span></div><div class="metric"><strong>${Number(result.netScore ?? 0).toFixed(2).replace('.', ',')}</strong><span>pontuação líquida</span></div><div class="metric"><strong>${durationLabel(result.durationSecs)}</strong><span>tempo</span></div></div><div class="result-tri-row"><div><b>${result.triEstimate ? `θ ${result.triEstimate.theta.toFixed(2).replace('.',',')}` : 'θ indisponível'}</b></div><div><b>${result.difficultyConsistency ? `${result.difficultyConsistency.percentage}%` : '—'}</b></div></div></article>${resultBreakdown}<div class="eyebrow">REVISÃO DAS RESPOSTAS</div><div style="height:10px"></div><div>${questions.map((q,index) => {
     const answer = state.activityAnswers.get(q.id) || {};
     const correctAnswer = getExpectedAnswer(q);
     const complete = responseIsComplete(q, answer.response);
     const status = complete ? (responseIsCorrect(q, answer.response) ? 'Correta' : 'Incorreta') : 'Em branco';
     const userValue = complete ? escapeHTML(answer.response) : (answer.response ? `Parcial (${escapeHTML(answer.response)}) — não contabilizada` : 'Sem resposta');
     const rightLabel = q.type === 'multiple_choice' ? `${correctAnswer}) ${q.alternatives?.[correctAnswer] || ''}` : correctAnswer;
-    return `<article class="result-question"><h3><span>Questão ${index+1} · ${escapeHTML(q.subject || '')}</span><span class="tag ${status === 'Correta' ? 'peach' : ''}">${status}</span></h3><p>${escapeHTML(q.statement)}</p><p>Sua resposta: <b>${userValue}</b> · Gabarito: <b>${escapeHTML(rightLabel)}</b></p>${q.explanation ? `<p>${richText(q.explanation)}</p>` : '<p>Esta questão não possui resolução comentada.</p>'}<button class="text-button" data-open-question="${safeAttr(q.id)}">Abrir questão completa ↗</button></article>`;
+    const selectedKey = String(answer.response || '').trim().toUpperCase();
+    const selectedAlternativeExplanation = q.type === 'multiple_choice' ? getAlternativeExplanationText(q, selectedKey) : '';
+    const selectedAlternativeImages = q.type === 'multiple_choice' ? renderAlternativeExplanationImages(q, selectedKey) : '';
+    const generalExplanationImages = renderExplanationImages(q);
+    const textBase = textBaseById(q.textBaseId);
+    return `<article class="result-question"><h3><span>Questão ${index+1} · ${escapeHTML(q.subject || '')}</span><span class="tag ${status === 'Correta' ? 'peach' : ''}">${status}</span></h3>${textBase ? `<div class="base-text"><b>${escapeHTML(textBase.title || 'Texto-base')}</b><div class="base-content" data-result-textbase-for="${safeAttr(q.id)}">${richText(textBase.content)}</div></div>` : ''}<p class="result-statement" data-result-statement-for="${safeAttr(q.id)}">${questionStatementHTML(q.statement)}</p>${renderQuestionReferences(q)}<p>Sua resposta: <b>${userValue}</b> · Gabarito: <b>${escapeHTML(rightLabel)}</b></p>${selectedAlternativeExplanation || selectedAlternativeImages ? `<div class="alternative-comment ${complete && responseIsCorrect(q, answer.response) ? 'correct' : 'wrong'}"><b>Comentário da alternativa selecionada (${escapeHTML(selectedKey)})</b>${selectedAlternativeExplanation ? `<p>${richText(selectedAlternativeExplanation)}</p>` : ''}${selectedAlternativeImages}</div>` : ''}${q.explanation || generalExplanationImages ? `<div class="full-explanation"><b>Resolução completa</b>${q.explanation ? `<p>${richText(q.explanation)}</p>` : ''}${generalExplanationImages}</div>` : ''}${complete && !responseIsCorrect(q,answer.response) ? `<label class="error-reason-inline"><span>O que melhor explica esse erro?</span><select data-error-reason data-answer-id="${safeAttr(answer.id)}"><option value="">Selecione o motivo</option><option value="content" ${answer.errorReason==='content'?'selected':''}>Falta de conteúdo</option><option value="interpretation" ${answer.errorReason==='interpretation'?'selected':''}>Interpretação do enunciado</option><option value="calculation" ${answer.errorReason==='calculation'?'selected':''}>Erro de cálculo</option><option value="confusion" ${answer.errorReason==='confusion'?'selected':''}>Confusão conceitual</option><option value="time" ${answer.errorReason==='time'?'selected':''}>Gestão do tempo</option><option value="insecurity" ${answer.errorReason==='insecurity'?'selected':''}>Insegurança na escolha</option><option value="other" ${answer.errorReason==='other'?'selected':''}>Outro motivo</option></select></label>` : ''}<button class="text-button" data-open-question="${safeAttr(q.id)}">Abrir questão completa ↗</button></article>`;
   }).join('')}</div><div class="exam-bottom"><button class="button secondary" data-page="performance">Ver desempenho</button><button class="button primary" data-action="new-activity">Voltar ao gerador</button></div></div>`;
-  $('.activity-layout').classList.add('hidden'); $('#activityNoQuestions').classList.add('hidden'); $('#activitySession').classList.remove('hidden');
+  unobserveAssetImages($('#activitySession'));
+  $('.activity-layout').classList.add('hidden'); $('#pendingTaskSection')?.classList.add('hidden'); $('#savedActivitiesSection')?.classList.add('hidden'); $('#activityNoQuestions').classList.add('hidden'); $('#activitySession').classList.remove('hidden');
+  await hydrateAssetImages($('#activitySession'));
+  for (const question of questions) {
+    const marks = state.activityAnswers.get(question.id)?.highlights || [];
+    applyTextMarks($(`[data-result-statement-for="${CSS.escape(question.id)}"]`), marks, 'statement');
+    applyTextMarks($(`[data-result-textbase-for="${CSS.escape(question.id)}"]`), marks, 'textBase');
+  }
 }
 
 async function computeQuestionAccuracy() {
@@ -515,84 +1068,228 @@ async function computeQuestionAccuracy() {
   return map;
 }
 function renderPerformance() {
-  const answers = completedAnswers();
-  const completedActivities = state.data.activities.filter(a => a.status === 'completed').sort((a,b) => Date.parse(a.endedAt || a.createdAt) - Date.parse(b.endedAt || b.createdAt));
-  $('#performanceEmpty').classList.toggle('hidden', answers.length > 0);
-  $('#performanceData').classList.toggle('hidden', answers.length === 0);
-  if (!answers.length) return;
-  const correct = answers.filter(a => a.isCorrect).length;
-  const wrong = answers.length - correct;
-  const pending = state.data.reviews.filter(r => r.status !== 'completed').length;
-  const totalStudySeconds = completedActivities.reduce((sum, activity) => sum + (Number(activity.durationSecs) || 0), 0);
-  $('#performanceMetrics').innerHTML = `<div class="metric-card"><strong>${Math.round(correct/answers.length*100)}%</strong><span>taxa de acerto</span></div><div class="metric-card"><strong>${correct}</strong><span>respostas corretas</span></div><div class="metric-card"><strong>${wrong}</strong><span>respostas incorretas</span></div><div class="metric-card"><strong>${pending}</strong><span>revisões pendentes</span></div><div class="metric-card"><strong>${durationLabel(totalStudySeconds)}</strong><span>tempo registrado em atividades</span></div>`;
+  const allCompleted = state.data.activities.filter(activity => activity.status === 'completed').sort((a,b) => Date.parse(a.endedAt || a.createdAt) - Date.parse(b.endedAt || b.createdAt));
+  const period = state.performancePeriod || 'all';
+  const cutoff = period === 'all' ? 0 : Date.now() - Number(period) * 86400000;
+  const completedActivities = allCompleted.filter(activity => Date.parse(activity.endedAt || activity.createdAt) >= cutoff);
+
+  const uniqueSorted = values => [...new Set(values.filter(Boolean))].sort((a,b) => String(a).localeCompare(String(b),'pt-BR'));
+  const filterOptions = [
+    { id: 'performanceAreaFilter', stateKey: 'performanceArea', values: uniqueSorted(state.data.questions.map(question => question.area)), placeholder: 'Todas as áreas' },
+    { id: 'performanceSubjectFilter', stateKey: 'performanceSubject', values: uniqueSorted(state.data.questions.map(question => question.subject)), placeholder: 'Todas as matérias' },
+    { id: 'performanceTopicFilter', stateKey: 'performanceTopic', values: uniqueSorted(state.data.questions.flatMap(question => topicValues(question))), placeholder: 'Todos os assuntos' }
+  ];
+  for (const item of filterOptions) {
+    const select = $(`#${item.id}`);
+    if (!select) continue;
+    const selected = state[item.stateKey] || '';
+    select.innerHTML = `<option value="">${item.placeholder}</option>${item.values.map(value => `<option value="${safeAttr(value)}">${escapeHTML(value)}</option>`).join('')}`;
+    select.value = item.values.includes(selected) ? selected : '';
+    state[item.stateKey] = select.value;
+  }
+  const filters = { area: state.performanceArea, subject: state.performanceSubject, topic: state.performanceTopic };
+  const matchesQuestion = question => Boolean(question) && (!filters.area || question.area === filters.area) && (!filters.subject || question.subject === filters.subject) && (!filters.topic || topicValues(question).some(value => normalizeSearch(value) === normalizeSearch(filters.topic)));
+  const buildActivityData = activities => activities.map(activity => ({ activity, records: activityPerformanceRecords(activity).filter(record => matchesQuestion(record.question)) })).filter(item => item.records.length);
+  const activityData = buildActivityData(completedActivities);
+  const allRecords = activityData.flatMap(item => item.records);
+  const answeredRecords = allRecords.filter(record => record.hasResponse);
+  const unanswered = Math.max(0, allRecords.length - answeredRecords.length);
+  const correct = answeredRecords.filter(record => record.isCorrect).length;
+  const wrong = answeredRecords.length - correct;
+  const precision = answeredRecords.length ? Math.round(correct / answeredRecords.length * 100) : 0;
+  const overall = allRecords.length ? Math.round(correct / allRecords.length * 100) : 0;
+  const distinctQuestions = new Set(answeredRecords.map(record => record.question.id)).size;
+  const pending = state.data.reviews.filter(review => review.status !== 'completed').length;
+  const totalStudySeconds = activityData.reduce((sum, item) => sum + (Number(item.activity.durationSecs) || 0), 0);
+  const hasPerformance = allRecords.length > 0;
+  $('#performanceEmpty').classList.toggle('hidden', hasPerformance || allCompleted.length > 0);
+  $('#performanceNoResults')?.classList.toggle('hidden', hasPerformance || allCompleted.length === 0);
+  $('#performanceData').classList.toggle('hidden', !hasPerformance);
+  const periodControl = $('#performancePeriod');
+  if (periodControl && periodControl.value !== period) periodControl.value = period;
+  const periodLabel = period === 'all' ? 'todo o histórico' : `os últimos ${period} dias`;
+  const activeFilters = [filters.area,filters.subject,filters.topic].filter(Boolean);
+  $('#performancePeriodNote').textContent = `${activityData.length} atividades com questões correspondentes em ${periodLabel}.${activeFilters.length ? ` Filtros ativos: ${activeFilters.join(' · ')}.` : ''}`;
+  if (!hasPerformance) return;
+
+  const sampleLabel = answeredRecords.length < 10 ? 'Amostra pequena' : answeredRecords.length < 30 ? 'Amostra em formação' : 'Amostra mais consistente';
+  let comparisonMarkup = '<div class="metric-card"><strong>—</strong><span>comparação de períodos</span><small>Selecione 7, 30 ou 90 dias para comparar.</small></div>';
+  if (period !== 'all') {
+    const windowMs = Number(period) * 86400000;
+    const previousStart = Date.now() - windowMs * 2;
+    const previousActivities = allCompleted.filter(activity => {
+      const time = Date.parse(activity.endedAt || activity.createdAt);
+      return time >= previousStart && time < cutoff;
+    });
+    const previousRecords = buildActivityData(previousActivities).flatMap(item => item.records).filter(record => record.hasResponse);
+    if (previousRecords.length) {
+      const previousCorrect = previousRecords.filter(record => record.isCorrect).length;
+      const delta = precision - Math.round(previousCorrect / previousRecords.length * 100);
+      comparisonMarkup = `<div class="metric-card"><strong>${delta > 0 ? '+' : ''}${delta} pp</strong><span>variação da precisão</span><small>vs. ${period} dias anteriores, com os mesmos filtros</small></div>`;
+    } else comparisonMarkup = '<div class="metric-card"><strong>—</strong><span>período anterior</span><small>Sem respostas suficientes para comparar.</small></div>';
+  }
+  $('#performanceMetrics').innerHTML = `${comparisonMarkup}<div class="metric-card"><strong>${precision}%</strong><span>precisão nas respondidas</span><small>${sampleLabel} · ${answeredRecords.length} respostas</small></div><div class="metric-card"><strong>${overall}%</strong><span>aproveitamento total</span><small>${correct} acertos em ${allRecords.length} questões</small></div><div class="metric-card"><strong>${correct}</strong><span>respostas corretas</span></div><div class="metric-card"><strong>${wrong}</strong><span>respostas incorretas</span></div><div class="metric-card"><strong>${unanswered}</strong><span>questões em branco</span></div><div class="metric-card"><strong>${distinctQuestions}</strong><span>questões únicas respondidas</span></div><div class="metric-card"><strong>${activityData.length}</strong><span>atividades com questões no filtro</span></div><div class="metric-card"><strong>${durationLabel(totalStudySeconds)}</strong><span>${activeFilters.length ? 'duração das atividades correspondentes' : 'tempo de estudo registrado'}</span></div><div class="metric-card"><strong>${pending}</strong><span>revisões pendentes (geral)</span></div>`;
+
   const confidenceNames = { unsure: 'Com dúvida', guess: 'Chutei', confident: 'Confiante' };
-  const confidenceSummary = ['unsure','guess','confident'].map(level => {
-    const subset = answers.filter(answer => (answer.confidence || 'unsure') === level);
-    const hits = subset.filter(answer => answer.isCorrect).length;
-    return `<div class="confidence-stat"><span>${confidenceNames[level]}</span><b>${subset.length ? `${Math.round(hits/subset.length*100)}%` : '—'}</b><small>${hits}/${subset.length} acertos</small></div>`;
+  $('#confidenceStats').innerHTML = ['unsure','guess','confident'].map(level => {
+    const subset = answeredRecords.filter(record => (record.answer.confidence || 'unsure') === level);
+    const hits = subset.filter(record => record.isCorrect).length;
+    return `<div class="confidence-stat"><span>${confidenceNames[level]}</span><b>${subset.length ? `${Math.round(hits / subset.length * 100)}%` : '—'}</b><small>${hits}/${subset.length} acertos</small></div>`;
   }).join('');
-  $('#confidenceStats').innerHTML = confidenceSummary;
-  const areaStats = Object.keys(SUBJECTS).map(area => {
-    const ids = new Set(state.data.questions.filter(q => q.area === area).map(q => q.id));
-    const selected = answers.filter(a => ids.has(a.questionId));
-    return { area, correct: selected.filter(a => a.isCorrect).length, total: selected.length, percentage: selected.length ? Math.round(selected.filter(a => a.isCorrect).length / selected.length * 100) : 0 };
-  });
-  $('#areaBars').innerHTML = areaStats.map(item => `<div class="bar-item"><div class="bar-label"><span>${escapeHTML(item.area)}</span><b>${item.total ? `${item.percentage}% · ${item.total} respostas` : 'Sem dados'}</b></div><div class="bar-track"><i style="width:${item.percentage}%"></i></div></div>`).join('');
-  const subjectStats = Object.values(SUBJECTS).flat().map(subject => {
-    const ids = new Set(state.data.questions.filter(q => q.subject === subject).map(q => q.id));
-    const selected = answers.filter(a => ids.has(a.questionId));
-    const hits = selected.filter(a => a.isCorrect).length;
-    return { subject, total: selected.length, percentage: selected.length ? Math.round(hits / selected.length * 100) : 0 };
-  }).filter(item => item.total).sort((a,b) => b.total - a.total || a.subject.localeCompare(b.subject));
-  $('#subjectBars').innerHTML = subjectStats.length ? subjectStats.map(item => `<div class="bar-item"><div class="bar-label"><span>${escapeHTML(item.subject)}</span><b>${item.percentage}% · ${item.total}</b></div><div class="bar-track"><i style="width:${item.percentage}%"></i></div></div>`).join('') : '<div class="empty-inline">Ainda não há respostas por matéria.</div>';
+
+  const renderDistribution = (records, keyGetter, targetId, emptyText) => {
+    const map = new Map();
+    records.forEach(record => {
+      const key = keyGetter(record.question) || 'Não informada';
+      const item = map.get(key) || { total: 0, correct: 0 };
+      item.total++;
+      if (record.isCorrect) item.correct++;
+      map.set(key,item);
+    });
+    const stats = [...map.entries()].map(([name,item]) => ({ name,...item, percentage: Math.round(item.correct / item.total * 100) })).sort((a,b) => b.total - a.total || a.name.localeCompare(b.name,'pt-BR'));
+    $(`#${targetId}`).innerHTML = stats.length ? stats.map(item => `<div class="bar-item"><div class="bar-label"><span>${escapeHTML(item.name)}</span><b>${item.percentage}% · ${item.total} respostas</b></div><div class="bar-track"><i style="width:${item.percentage}%"></i></div></div>`).join('') : `<div class="empty-inline">${emptyText}</div>`;
+  };
+  renderDistribution(answeredRecords, question => question.area, 'areaBars', 'Sem respostas por área no período.');
+  renderDistribution(answeredRecords, question => question.subject, 'subjectBars', 'Sem respostas por matéria no período.');
+  renderDistribution(answeredRecords, question => question.difficulty, 'difficultyBars', 'Sem respostas classificadas por dificuldade.');
+
   const topicMap = new Map();
-  answers.forEach(answer => {
-    const question = questionById(answer.questionId); if (!question) return;
-    const key = `${question.subject || question.area} · ${question.primaryTopic || 'Sem assunto'}`;
-    const item = topicMap.get(key) || { total: 0, correct: 0 };
-    item.total++; if (answer.isCorrect) item.correct++;
-    topicMap.set(key,item);
+  answeredRecords.forEach(record => {
+    const question = record.question;
+    const topics = topicValues(question);
+    for (const topic of topics.length ? topics : ['Sem assunto']) {
+      const key = `${question.subject || question.area || 'Conteúdo'} · ${topic}`;
+      const item = topicMap.get(key) || { subject: question.subject || question.area || 'Conteúdo', topic, total: 0, correct: 0 };
+      item.total++; if (record.isCorrect) item.correct++;
+      topicMap.set(key,item);
+    }
   });
-  const weak = [...topicMap.entries()].map(([name,item]) => ({name,...item,accuracy:item.correct/item.total})).sort((a,b)=>a.accuracy-b.accuracy).slice(0,6);
-  $('#weakTopics').innerHTML = weak.length ? weak.map(item => `<div class="compact-item"><span><b>${escapeHTML(item.name)}</b><small>${item.correct}/${item.total} acertos</small></span><strong>${Math.round(item.accuracy*100)}%</strong></div>`).join('') : '<div class="empty-inline">Ainda não há assuntos suficientes.</div>';
+  const topicStats = [...topicMap.entries()].map(([name,item]) => ({ name,...item, accuracy: item.correct / item.total })).sort((a,b) => a.accuracy - b.accuracy || b.total - a.total);
+  $('#weakTopics').innerHTML = topicStats.length ? topicStats.slice(0,8).map(item => `<div class="compact-item"><span><b>${escapeHTML(item.name)}</b><small>${item.correct}/${item.total} acertos · ${item.total < 5 ? 'Amostra pequena; diagnóstico preliminar' : item.accuracy < .6 ? 'Prioridade de retomada' : item.accuracy < .8 ? 'Reforçar e praticar' : 'Desempenho consistente'}</small></span><strong>${Math.round(item.accuracy * 100)}%</strong></div>`).join('') : '<div class="empty-inline">Ainda não há assuntos suficientes.</div>';
+
   const errorPatterns = new Map();
-  answers.filter(answer => answer.isCorrect === false).forEach(answer => {
-    const question = questionById(answer.questionId);
-    for (const category of question?.errorCategories || []) {
+  answeredRecords.filter(record => !record.isCorrect).forEach(record => {
+    const rawCategories = record.question?.errorCategories;
+    const categories = Array.isArray(rawCategories) ? rawCategories : (typeof rawCategories === 'string' ? [rawCategories] : []);
+    for (const category of categories) {
       const label = String(category).trim();
-      if (!label) continue;
-      errorPatterns.set(label, (errorPatterns.get(label) || 0) + 1);
+      if (label) errorPatterns.set(label,(errorPatterns.get(label) || 0) + 1);
     }
   });
-  const rankedErrors = [...errorPatterns.entries()].sort((a,b) => b[1]-a[1] || a[0].localeCompare(b[0])).slice(0,8);
-  $('#errorPatternList').innerHTML = rankedErrors.length ? rankedErrors.map(([name,count]) => `<div class="compact-item"><span><b>${escapeHTML(name)}</b><small>Questões incorretas associadas</small></span><strong>${count}</strong></div>`).join('') : '<div class="empty-inline">As questões importadas ainda não fornecem categorias de erro suficientes, ou nenhuma questão classificada foi respondida incorretamente.</div>';
-  $('#activityHistory').innerHTML = completedActivities.slice().reverse().slice(0,8).map(item => `<div class="history-row"><span><b>${escapeHTML(item.title)}</b><small>${formatDate(item.endedAt || item.createdAt)} · ${item.result?.total || 0} questões · ${durationLabel(item.durationSecs)}</small></span><span class="history-score">${item.result?.percentage ?? 0}%</span></div>`).join('') || '<div class="empty-inline">Nenhuma atividade concluída.</div>';
-  renderTriEstimate(answers);
+  const rankedErrors = [...errorPatterns.entries()].sort((a,b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0,8);
+  $('#errorPatternList').innerHTML = rankedErrors.length ? rankedErrors.map(([name,count]) => `<div class="compact-item"><span><b>${escapeHTML(name)}</b><small>Metadado associado às questões incorretas</small></span><strong>${count}</strong></div>`).join('') : '<div class="empty-inline">As questões erradas não possuem categorias classificadas.</div>';
+
+  const errorReasons = new Map();
+  answeredRecords.filter(record => !record.isCorrect && record.answer.errorReason).forEach(record => {
+    const reason = errorReasonLabel(record.answer.errorReason);
+    errorReasons.set(reason,(errorReasons.get(reason) || 0) + 1);
+  });
+  const reasonEntries = [...errorReasons.entries()].sort((a,b) => b[1] - a[1]);
+  $('#errorReasonList').innerHTML = reasonEntries.length ? reasonEntries.map(([name,count]) => `<div class="compact-item"><span><b>${escapeHTML(name)}</b><small>Motivo informado pelo estudante</small></span><strong>${count}</strong></div>`).join('') : '<div class="empty-inline">Ao revisar uma resposta incorreta, informe o motivo para criar este diagnóstico.</div>';
+
+  const trend = activityData.slice(-12);
+  if (trend.length) {
+    const w = 560, h = 150, pad = 22;
+    const coords = trend.map((item,index) => {
+      const itemCorrect = item.records.filter(record => record.hasResponse && record.isCorrect).length;
+      const percentage = Math.round(itemCorrect / item.records.length * 100);
+      return { x: trend.length === 1 ? w / 2 : pad + index * (w - 2 * pad) / (trend.length - 1), y: h - pad - (percentage / 100) * (h - 2 * pad), value: percentage, label: item.activity.title || 'Atividade' };
+    });
+    const polyline = coords.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
+    $('#performanceTrend').innerHTML = `<div class="trend-summary"><b>${coords.at(-1).value}%</b><span>aproveitamento na última atividade · ${coords.length} pontos no gráfico${activeFilters.length ? ' · filtros aplicados' : ''}</span></div><svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Evolução do aproveitamento nas atividades concluídas"><line x1="${pad}" y1="${pad}" x2="${w-pad}" y2="${pad}" class="trend-grid-line"/><line x1="${pad}" y1="${h/2}" x2="${w-pad}" y2="${h/2}" class="trend-grid-line"/><line x1="${pad}" y1="${h-pad}" x2="${w-pad}" y2="${h-pad}" class="trend-grid-line"/><polyline points="${polyline}" class="trend-line"/>${coords.map(point => `<circle cx="${point.x}" cy="${point.y}" r="4" class="trend-point"><title>${escapeHTML(point.label)}: ${point.value}%</title></circle>`).join('')}</svg><div class="trend-axis"><span>0%</span><span>50%</span><span>100%</span></div>`;
+  } else $('#performanceTrend').innerHTML = '<div class="empty-inline">Conclua atividades para acompanhar sua evolução.</div>';
+
+  const recommendations = topicStats.filter(item => item.total >= 3 && item.accuracy < .8).slice(0,5);
+  $('#studyRecommendations').innerHTML = recommendations.map(item => {
+    const priority = item.total >= 5 && item.accuracy < .6;
+    const label = priority ? 'Prioridade alta' : 'Consolidar';
+    const ids = state.data.questions.filter(question => (question.subject || question.area || 'Conteúdo') === item.subject && topicValues(question).some(value => normalizeSearch(value) === normalizeSearch(item.topic))).map(question => question.id);
+    return `<article class="recommendation-item"><div><span class="tag ${priority ? 'danger-tag' : 'warning-tag'}">${label}</span><b>${escapeHTML(item.name)}</b><small>${Math.round(item.accuracy * 100)}% de precisão · ${item.total} respostas analisadas${item.total < 5 ? ' · amostra ainda limitada' : ''}</small></div><button class="button small secondary" data-action="create-pending-topic-task" data-subject="${safeAttr(item.subject)}" data-topic="${safeAttr(item.topic)}" ${ids.length ? '' : 'disabled'}>Criar tarefa</button></article>`;
+  }).join('') || '<div class="empty-inline">Ainda não há dados suficientes para recomendações confiáveis. Continue resolvendo atividades para formar seu diagnóstico.</div>';
+
+  $('#activityHistory').innerHTML = activityData.slice().reverse().map(item => {
+    const records = item.records;
+    const answered = records.filter(record => record.hasResponse).length;
+    const hits = records.filter(record => record.hasResponse && record.isCorrect).length;
+    const errors = records.filter(record => record.hasResponse && !record.isCorrect).length;
+    const blanks = records.length - answered;
+    const score = Math.round(hits / records.length * 100);
+    return `<div class="history-row"><span><b>${escapeHTML(item.activity.title)}</b><small>${formatDate(item.activity.endedAt || item.activity.createdAt)} · ${hits} acertos · ${errors} erros · ${blanks} em branco · ${records.length} questões no filtro · ${durationLabel(item.activity.durationSecs)}</small></span><span class="activity-history-actions"><strong class="history-score">${score}%</strong><button class="text-button" data-action="view-activity-result" data-id="${safeAttr(item.activity.id)}">Ver resultado completo</button></span></div>`;
+  }).join('') || '<div class="empty-inline">Nenhuma atividade concluída no período.</div>';
+  renderTriEstimate(answeredRecords.map(record => record.answer), activityData.map(item => item.activity), filters);
 }
-function renderTriEstimate(answers) {
-  const byActivity = new Map();
-  for (const answer of answers) {
-    const question = questionById(answer.questionId);
-    const tri = question?.triParameters;
-    if (!tri || ![tri.a,tri.b,tri.c].every(Number.isFinite) || tri.a <= 0 || tri.c < 0 || tri.c >= 1) continue;
-    if (!byActivity.has(answer.activityId)) byActivity.set(answer.activityId, []);
-    byActivity.get(answer.activityId).push({ ...tri, correct: Boolean(answer.isCorrect) });
-  }
-  const candidate = [...byActivity.values()].sort((a,b)=>b.length-a.length)[0];
-  if (!candidate || candidate.length < 5) {
-    $('#triPanel').innerHTML = '<div class="empty-inline"><b>Estimativa ainda indisponível</b><p>São necessários pelo menos cinco itens respondidos com parâmetros a, b e c importados. Não usamos parâmetros inventados.</p></div>';
-    return;
-  }
-  let bestTheta = 0; let bestLikelihood = -Infinity;
-  for (let theta = -4; theta <= 4.001; theta += .025) {
-    let logLikelihood = 0;
-    for (const item of candidate) {
-      const probability = item.c + (1-item.c)/(1+Math.exp(-1.7*item.a*(theta-item.b)));
-      logLikelihood += item.correct ? Math.log(Math.max(probability,1e-9)) : Math.log(Math.max(1-probability,1e-9));
+function errorReasonLabel(value) {
+  return ({ content:'Falta de conteúdo', interpretation:'Interpretação do enunciado', calculation:'Erro de cálculo', confusion:'Confusão conceitual', time:'Gestão do tempo', insecurity:'Insegurança na escolha', other:'Outro motivo' })[value] || 'Não informado';
+}
+
+function validTriParameters(question) {
+  const tri = question?.triParameters;
+  return Boolean(tri && ['a','b','c'].every(key => tri[key] !== null && tri[key] !== undefined && tri[key] !== '') && Number.isFinite(Number(tri.a)) && Number.isFinite(Number(tri.b)) && Number.isFinite(Number(tri.c)) && Number(tri.a) > 0 && Number(tri.c) >= 0 && Number(tri.c) < 1);
+}
+function estimateTriTheta(records) {
+  const items = records.filter(record => record.hasResponse && validTriParameters(record.question)).map(record => ({
+    a: Number(record.question.triParameters.a), b: Number(record.question.triParameters.b), c: Number(record.question.triParameters.c), correct: Boolean(record.isCorrect)
+  }));
+  if (items.length < 5) return null;
+  let bestTheta = 0, bestPosterior = -Infinity;
+  // MAP estimate with a standard-normal prior: regularizes small samples and avoids unstable extremes.
+  for (let theta = -4; theta <= 4.001; theta += .01) {
+    let logPosterior = -.5 * theta * theta;
+    for (const item of items) {
+      const z = Math.max(-40, Math.min(40, -1.7 * item.a * (theta - item.b)));
+      const probability = Math.min(1 - 1e-9, Math.max(1e-9, item.c + (1-item.c)/(1+Math.exp(z))));
+      logPosterior += item.correct ? Math.log(probability) : Math.log(1-probability);
     }
-    if (logLikelihood > bestLikelihood) { bestLikelihood = logLikelihood; bestTheta = theta; }
+    if (logPosterior > bestPosterior) { bestPosterior = logPosterior; bestTheta = theta; }
   }
-  $('#triPanel').innerHTML = `<div class="metric-row"><div class="metric"><strong>θ ${bestTheta.toFixed(2).replace('.',',')}</strong><span>estimativa experimental</span></div><div class="metric"><strong>${candidate.length}</strong><span>itens parametrizados</span></div></div><p class="fine-print">Estimativa por verossimilhança usando parâmetros importados. Não representa uma nota oficial do ENEM.</p>`;
+  return { theta: bestTheta, count: items.length, method: '3PL-MAP' };
+}
+function calculateDifficultyConsistency(records) {
+  const levels = { 'facil': 1, 'facil ': 1, 'media': 2, 'medio': 2, 'dificil': 3 };
+  const counts = { easy: { total: 0, wrong: 0 }, medium: { total: 0, wrong: 0 }, hard: { total: 0, wrong: 0 } };
+  const keys = { 1: 'easy', 2: 'medium', 3: 'hard' };
+  for (const record of records) {
+    if (!record.hasResponse || !record.question?.difficulty) continue;
+    const level = levels[normalizeSearch(record.question.difficulty)];
+    const key = keys[level];
+    if (!key) continue;
+    counts[key].total++;
+    if (!record.isCorrect) counts[key].wrong++;
+  }
+  const easy = counts.easy, medium = counts.medium, hard = counts.hard;
+  const comparisons = easy.total * (medium.total + hard.total) + medium.total * hard.total;
+  const inversions = easy.wrong * ((medium.total - medium.wrong) + (hard.total - hard.wrong)) + medium.wrong * (hard.total - hard.wrong);
+  return comparisons ? { percentage: Math.round((1 - inversions / comparisons) * 100), inversions, comparisons } : null;
+}
+function activityPerformanceRecords(activity) {
+  const answers = new Map(state.data.answers.filter(answer => answer.activityId === activity.id).map(answer => [answer.questionId, answer]));
+  return activity.questionIds.map(id => {
+    const question = questionById(id);
+    const answer = answers.get(id) || {};
+    const hasResponse = responseIsComplete(question || {}, answer.response);
+    return { question, answer, hasResponse, isCorrect: hasResponse && responseIsCorrect(question, answer.response) };
+  }).filter(item => item.question);
+}
+function renderTriEstimate(_answers, selectedActivities = null, filters = {}) {
+  const completedActivities = Array.isArray(selectedActivities) ? selectedActivities.slice().sort((a,b) => Date.parse(b.endedAt || b.createdAt) - Date.parse(a.endedAt || a.createdAt)) : state.data.activities.filter(item => item.status === 'completed').sort((a,b) => Date.parse(b.endedAt || b.createdAt) - Date.parse(a.endedAt || a.createdAt));
+  const matchesQuestion = question => Boolean(question) && (!filters.area || question.area === filters.area) && (!filters.subject || question.subject === filters.subject) && (!filters.topic || topicValues(question).some(value => normalizeSearch(value) === normalizeSearch(filters.topic)));
+  const recordsForActivity = activity => activityPerformanceRecords(activity).filter(record => matchesQuestion(record.question));
+  const relevantActivities = completedActivities.filter(activity => recordsForActivity(activity).length);
+  const latestActivity = relevantActivities[0];
+  const latestRecords = latestActivity ? recordsForActivity(latestActivity) : [];
+  let calibrated = null;
+  for (const activity of relevantActivities) {
+    const estimate = estimateTriTheta(recordsForActivity(activity));
+    if (estimate) { calibrated = { ...estimate, activity }; break; }
+  }
+  const consistency = calculateDifficultyConsistency(latestRecords);
+  const triHtml = calibrated
+    ? `<div class="metric"><strong>θ ${calibrated.theta.toFixed(2).replace('.',',')}</strong><span>${calibrated.count} itens calibrados · ${formatDate(calibrated.activity.endedAt || calibrated.activity.createdAt)}</span></div>`
+    : `<div class="metric"><strong>—</strong><span>Sem parâmetros calibrados</span></div>`;
+  const consistencyHtml = consistency
+    ? `<div class="metric"><strong>${consistency.percentage}%</strong><span>coerência entre níveis de dificuldade</span></div>`
+    : `<div class="metric"><strong>—</strong><span>Classifique questões como fácil, média ou difícil para analisar consistência</span></div>`;
+  $('#triPanel').innerHTML = `<div class="metric-row">${triHtml}${consistencyHtml}</div>`;
 }
 
 function renderReviews() {
@@ -627,9 +1324,357 @@ async function renderSettings() {
   const persisted = await navigator.storage?.persisted?.().catch(() => false);
   const usage = estimate?.usage ?? null; const quota = estimate?.quota ?? null;
   $('#storageDiagnostics').innerHTML = `<div class="diagnostic-row"><span>Questões</span><b>${counts.questions}</b></div><div class="diagnostic-row"><span>Imagens e arquivos</span><b>${counts.assets}</b></div><div class="diagnostic-row"><span>Atividades</span><b>${counts.activities}</b></div><div class="diagnostic-row"><span>Respostas registradas</span><b>${counts.answers}</b></div><div class="diagnostic-row"><span>Revisões</span><b>${counts.reviews}</b></div><div class="diagnostic-row"><span>Espaço utilizado pelo navegador</span><b>${usage == null ? 'Não informado' : formatBytes(usage)}</b></div><div class="diagnostic-row"><span>Limite estimado</span><b>${quota == null ? 'Não informado' : formatBytes(quota)}</b></div><div class="diagnostic-row"><span>Armazenamento persistente</span><b>${persisted ? 'Concedido' : 'Não concedido'}</b></div>`;
-  const imports = [...state.data.imports].sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)).slice(0,12);
+  const imports = [...state.data.imports].sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)).slice(0,20);
   $('#importHistoryEmpty').classList.toggle('hidden', imports.length > 0);
-  $('#importHistory').innerHTML = imports.map(item => `<div class="history-row"><span><b>${escapeHTML(item.packageName || item.fileName || 'Operação')}</b><small>${formatDate(item.createdAt, true)} · ${escapeHTML(item.operation || 'Importação')} · ${item.importedCount ?? 0} questões</small></span><span class="tag peach">${escapeHTML(item.status || 'Concluída')}</span></div>`).join('');
+  $('#importHistory').innerHTML = imports.map(item => {
+    const ids = importRecordQuestionIds(item);
+    const total = Number.isFinite(Number(item.packageQuestionCount)) ? Number(item.packageQuestionCount) : (ids.length || Number(item.importedCount) || 0);
+    const canCreate = ids.length > 0 && ['Concluída', 'Parcial'].includes(item.status || 'Concluída');
+    const unavailable = '';
+    return `<div class="history-row import-history-row"><div class="import-history-main"><b>${escapeHTML(item.packageName || item.fileName || 'Operação')}</b><small>${formatDate(item.createdAt, true)} · ${escapeHTML(item.operation || 'Importação')} · ${total} questões no pacote</small>${unavailable}</div><div class="import-history-actions"><span class="tag peach">${escapeHTML(item.status || 'Concluída')}</span>${canCreate ? `<button class="button primary" type="button" data-action="create-task-from-record" data-id="${safeAttr(item.id)}">Criar tarefa ↗</button>` : ''}<button class="button small danger" type="button" data-action="delete-import-package-from-record" data-id="${safeAttr(item.id)}">Excluir pacote e questões</button></div></div>`;
+  }).join('');
+}
+function getImportGroups() {
+  const groups = new Map();
+  for (const record of state.data.imports || []) {
+    const key = String(record.packageId || record.id);
+    const group = groups.get(key) || { key, packageId: record.packageId || null, name: record.packageName || record.fileName || 'Pacote importado', records: [], ids: new Set(), createdAt: record.createdAt || '', status: record.status || 'Concluída', fileNames: new Set() };
+    group.records.push(record);
+    group.name = record.packageName || group.name;
+    if (record.fileName) group.fileNames.add(record.fileName);
+    if (!group.createdAt || Date.parse(record.createdAt) < Date.parse(group.createdAt)) group.createdAt = record.createdAt;
+    if (Date.parse(record.createdAt || 0) >= Date.parse(group.latestAt || 0)) { group.latestAt = record.createdAt; group.status = record.status || 'Concluída'; }
+    importRecordQuestionIds(record).forEach(id => group.ids.add(id));
+    (Array.isArray(record.questionIds) ? record.questionIds : []).forEach(id => { if (questionById(id)) group.ids.add(id); });
+    groups.set(key,group);
+  }
+  return [...groups.values()].map(group => ({ ...group, ids: [...group.ids], records: group.records.sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)) }));
+}
+function setBankTab(tab) {
+  state.bankTab = tab === 'packages' ? 'packages' : 'questions';
+  const questions = $('#bankQuestionsView'); const packages = $('#bankPackagesView');
+  if (questions) questions.classList.toggle('hidden',state.bankTab !== 'questions');
+  if (packages) packages.classList.toggle('hidden',state.bankTab !== 'packages');
+  $$('[data-bank-tab]').forEach(button => {
+    const active = button.dataset.bankTab === state.bankTab;
+    button.classList.toggle('active',active); button.setAttribute('aria-selected',String(active));
+  });
+}
+function renderPackageHistory() {
+  const host = $('#packageHistory'); if (!host) return;
+  let groups = getImportGroups();
+  const query = normalizeSearch($('#packageSearch')?.value || '');
+  const status = $('#packageStatusFilter')?.value || '';
+  const sort = $('#packageSort')?.value || 'recent';
+  groups = groups.filter(group => (!query || normalizeSearch([group.name,group.packageId,...group.fileNames,...group.records.map(item=>item.operation)].join(' ')).includes(query)) && (!status || group.status === status));
+  groups.sort((a,b)=> sort === 'oldest' ? Date.parse(a.createdAt)-Date.parse(b.createdAt) : sort === 'largest' ? b.ids.length-a.ids.length : sort === 'name' ? a.name.localeCompare(b.name,'pt-BR') : Date.parse(b.latestAt || b.createdAt)-Date.parse(a.latestAt || a.createdAt));
+  const allGroups = getImportGroups();
+  const totalQuestions = new Set(allGroups.flatMap(group=>group.ids)).size;
+  $('#packageOverview').innerHTML = `<div class="metric-card"><strong>${allGroups.length}</strong><span>pacotes registrados</span></div><div class="metric-card"><strong>${totalQuestions.toLocaleString('pt-BR')}</strong><span>questões vinculadas a pacotes</span></div><div class="metric-card"><strong>${state.data.imports.length}</strong><span>operações no histórico</span></div>`;
+  $('#packageCount').textContent = `${groups.length} ${groups.length===1?'pacote encontrado':'pacotes encontrados'}`;
+  $('#packageHistoryEmpty').classList.toggle('hidden',groups.length>0);
+  const selectedCount=state.selectedPackageKeys.size; const combineButton=$('#combineSelectedPackages'); if(combineButton){combineButton.disabled=!selectedCount;combineButton.textContent=selectedCount?`Montar tarefa (${selectedCount})`:'Montar tarefa com selecionados';}
+  host.innerHTML = groups.map(group => {
+    const shared = group.ids.filter(id => allGroups.some(other=>other.key!==group.key && other.ids.includes(id))).length;
+    const files = [...group.fileNames].join(' · ');
+    const packageQuestions=group.ids.map(id=>questionById(id)).filter(Boolean);
+    const imageQuestions=packageQuestions.filter(question=>(question.images||[]).length>0).length;
+    const areaLabels=[...new Set(packageQuestions.map(question=>question.area).filter(Boolean))];
+    const subjectLabels=[...new Set(packageQuestions.map(question=>question.subject).filter(Boolean))];
+    return `<article class="package-card"><div class="package-card-heading"><div class="package-card-title-wrap"><label class="package-select"><input type="checkbox" data-package-select="${safeAttr(group.key)}" ${state.selectedPackageKeys.has(group.key)?'checked':''}/><span>Incluir na seleção</span></label><span class="tag peach">${escapeHTML(group.status)}</span><h3>${escapeHTML(group.name)}</h3><p>${formatDate(group.latestAt || group.createdAt,true)} · ${group.ids.length} questões · ${imageQuestions} com imagens · ${group.records.length} ${group.records.length===1?'importação':'operações'}</p>${areaLabels.length?`<small>Áreas: ${escapeHTML(areaLabels.slice(0,3).join(', '))}${areaLabels.length>3?` +${areaLabels.length-3}`:''}</small>`:''}${subjectLabels.length?`<small>Matérias: ${escapeHTML(subjectLabels.slice(0,4).join(', '))}${subjectLabels.length>4?` +${subjectLabels.length-4}`:''}</small>`:''}${files?`<small>Arquivos: ${escapeHTML(files)}</small>`:''}<small>${shared?`${shared} questões compartilhadas com outros pacotes`:'Sem compartilhamento identificado entre pacotes'}</small></div><span class="package-icon">▤</span></div><div class="package-actions"><button class="button small secondary" data-action="package-details" data-package-key="${safeAttr(group.key)}">Ver questões</button><button class="button small primary" data-action="create-task-from-package" data-package-key="${safeAttr(group.key)}" ${group.ids.length?'':'disabled'}>Criar tarefa</button><button class="button small danger" data-action="delete-package" data-package-key="${safeAttr(group.key)}">Excluir pacote e questões</button></div></article>`;
+  }).join('');
+}
+function findImportGroup(key) { return getImportGroups().find(group=>group.key===String(key)); }
+function openPackageDetails(key) {
+  const group=findImportGroup(key); if(!group) return toast('Pacote não encontrado.');
+  const rows=group.ids.map(id=>questionById(id)).filter(Boolean).map((question,index)=>`<article class="package-question-row"><span class="question-number">${index+1}</span><div><div class="question-meta"><span class="tag peach">${escapeHTML(question.subject||question.area)}</span><span class="tag">${escapeHTML(question.difficulty||'Sem nível')}</span></div><b>${escapeHTML(question.id)}</b><p>${escapeHTML(String(question.statement||'').slice(0,220))}${String(question.statement||'').length>220?'…':''}</p><small>${escapeHTML(question.primaryTopic||'Sem assunto')} · ${question.images?.length||0} imagens</small></div><button class="button small secondary" data-open-question="${safeAttr(question.id)}">Abrir</button></article>`).join('');
+  openModal(group.name,`<div class="package-detail-summary"><b>${group.ids.length} questões</b><span>${group.records.length} registros de importação · ${formatDate(group.latestAt||group.createdAt,true)}</span></div><div class="package-question-list">${rows||'<div class="empty-inline">Nenhuma questão deste pacote está disponível.</div>'}</div>`,`<button class="button secondary" data-action="close-modal">Fechar</button><button class="button primary" data-action="create-task-from-package" data-package-key="${safeAttr(group.key)}">Criar tarefa ↗</button>`,'DETALHES DO PACOTE');
+}
+async function deletePackageContents(key, { records: suppliedRecords = null, packageId: suppliedPackageId = null, questionIds: suppliedQuestionIds = [], confirmUser = true, quiet = false } = {}) {
+  const normalizedKey = String(key);
+  const group = findImportGroup(normalizedKey);
+  const targetRecords = group?.records || suppliedRecords || [];
+  const targetRecordIds = new Set(targetRecords.map(record => record.id));
+  const packageId = group?.packageId || suppliedPackageId || targetRecords.find(record => record.packageId)?.packageId || null;
+  const targetCollections = state.data.collections.filter(collection => collection.type === 'sourceExam' && (
+    packageId ? collection.packageId === packageId : targetRecordIds.has(collection.packageId)
+  ));
+  const targetCollectionIds = new Set(targetCollections.map(collection => collection.id));
+  const allQuestionIds = new Set([
+    ...(group?.ids || []),
+    ...suppliedQuestionIds,
+    ...targetRecords.flatMap(record => Array.isArray(record.questionIds) ? record.questionIds : []),
+    ...targetCollections.flatMap(collection => [...(collection.questionIds || []), ...(collection.originalOrder || [])])
+  ].filter(id => id != null).map(String));
+  if (!targetRecords.length && !allQuestionIds.size && !targetCollectionIds.size) {
+    if (!quiet) toast('Pacote não encontrado ou sem conteúdo vinculado.');
+    return false;
+  }
+
+  const questionMap = new Map(state.data.questions.map(question => [String(question.id), question]));
+  const removedQuestions = [...allQuestionIds].map(id => questionMap.get(id)).filter(Boolean);
+  const remainingQuestions = state.data.questions.filter(question => !allQuestionIds.has(String(question.id)));
+  const collectQuestionAssets = question => [
+    ...(question.images || []),
+    ...((question.versionHistory || []).flatMap(version => version.images || []))
+  ].map(image => image.assetId).filter(Boolean);
+  const collectQuestionTextBases = question => [
+    question.textBaseId,
+    ...((question.versionHistory || []).map(version => version.textBaseId))
+  ].filter(Boolean);
+  const remainingAssetIds = new Set(remainingQuestions.flatMap(collectQuestionAssets));
+  const candidateAssetIds = new Set(removedQuestions.flatMap(collectQuestionAssets));
+  const removableAssetIds = [...candidateAssetIds].filter(id => !remainingAssetIds.has(id));
+  const remainingTextBaseIds = new Set(remainingQuestions.flatMap(collectQuestionTextBases));
+  const candidateTextBaseIds = new Set(removedQuestions.flatMap(collectQuestionTextBases));
+  const removableTextBaseIds = [...candidateTextBaseIds].filter(id => !remainingTextBaseIds.has(id));
+
+  const updatedImports = [];
+  for (const record of state.data.imports) {
+    if (targetRecordIds.has(record.id) || !Array.isArray(record.questionIds)) continue;
+    const filteredIds = record.questionIds.filter(id => !allQuestionIds.has(String(id)));
+    if (filteredIds.length !== record.questionIds.length) {
+      updatedImports.push({ ...record, questionIds: filteredIds, packageQuestionCount: filteredIds.length, updatedAt: nowISO() });
+    }
+  }
+  const updatedCollections = [];
+  for (const collection of state.data.collections) {
+    if (targetCollectionIds.has(collection.id)) continue;
+    const nextQuestionIds = Array.isArray(collection.questionIds) ? collection.questionIds.filter(id => !allQuestionIds.has(String(id))) : collection.questionIds;
+    const nextOriginalOrder = Array.isArray(collection.originalOrder) ? collection.originalOrder.filter(id => !allQuestionIds.has(String(id))) : collection.originalOrder;
+    const changed = (Array.isArray(collection.questionIds) && nextQuestionIds.length !== collection.questionIds.length) || (Array.isArray(collection.originalOrder) && nextOriginalOrder.length !== collection.originalOrder.length);
+    if (changed) updatedCollections.push({ ...collection, ...(Array.isArray(collection.questionIds) ? { questionIds: nextQuestionIds } : {}), ...(Array.isArray(collection.originalOrder) ? { originalOrder: nextOriginalOrder } : {}), updatedAt: nowISO() });
+  }
+
+  const updatedActivities = [];
+  const deletedActivityIds = new Set();
+  for (const activity of state.data.activities) {
+    if (!['pending', 'running', 'paused'].includes(activity.status) || !Array.isArray(activity.questionIds)) continue;
+    const filteredIds = activity.questionIds.filter(id => !allQuestionIds.has(String(id)));
+    if (filteredIds.length === activity.questionIds.length) continue;
+    if (!filteredIds.length) deletedActivityIds.add(activity.id);
+    else updatedActivities.push({ ...activity, questionIds: filteredIds, updatedAt: nowISO() });
+  }
+  const answerIdsToDelete = state.data.answers.filter(answer =>
+    deletedActivityIds.has(answer.activityId) || (allQuestionIds.has(String(answer.questionId)) && state.data.activities.some(activity => activity.id === answer.activityId && ['pending', 'running', 'paused'].includes(activity.status)))
+  ).map(answer => answer.id);
+  const reviewIdsToDelete = state.data.reviews.filter(review => allQuestionIds.has(String(review.questionId))).map(review => review.id);
+  const aliasIdsToDelete = state.data.aliases.filter(alias => allQuestionIds.has(String(alias.questionId))).map(alias => alias.alias);
+
+  if (confirmUser) {
+    const name = group?.name || targetRecords[0]?.packageName || targetRecords[0]?.fileName || 'Pacote importado';
+    const summary = `${name}\n\nRegistros de importação: ${targetRecords.length}\nQuestões que serão apagadas: ${allQuestionIds.size}\nQuestões encontradas no banco: ${removedQuestions.length}\nImagens sem outros vínculos: ${removableAssetIds.length}\nTextos-base sem outros vínculos: ${removableTextBaseIds.length}\n\nAs questões serão excluídas mesmo que estejam compartilhadas com outros pacotes, coleções ou favoritos. Atividades concluídas e seus resultados anteriores serão mantidos; tarefas e atividades em andamento serão ajustadas.`;
+    if (!confirm(`Excluir o pacote e todas as suas questões?\n\n${summary}\n\nEsta ação não pode ser desfeita. Faça um backup antes de continuar.`)) return false;
+  }
+
+  state.selectedPackageKeys.delete(normalizedKey);
+  if (updatedImports.length || updatedCollections.length || updatedActivities.length) {
+    await writeBatch(state.db, {
+      ...(updatedImports.length ? { imports: updatedImports } : {}),
+      ...(updatedCollections.length ? { collections: updatedCollections } : {}),
+      ...(updatedActivities.length ? { activities: updatedActivities } : {})
+    });
+  }
+  if (targetRecordIds.size) await deleteRecords(state.db, 'imports', [...targetRecordIds]);
+  if (targetCollectionIds.size) await deleteRecords(state.db, 'collections', [...targetCollectionIds]);
+  if (allQuestionIds.size) await deleteRecords(state.db, 'questions', [...allQuestionIds]);
+  if (removableAssetIds.length) {
+    await deleteRecords(state.db, 'assets', removableAssetIds);
+    await deleteRecords(state.db, 'assetBlobs', removableAssetIds);
+  }
+  if (removableTextBaseIds.length) await deleteRecords(state.db, 'textBases', removableTextBaseIds);
+  if (aliasIdsToDelete.length) await deleteRecords(state.db, 'aliases', aliasIdsToDelete);
+  if (reviewIdsToDelete.length) await deleteRecords(state.db, 'reviews', reviewIdsToDelete);
+  if (answerIdsToDelete.length) await deleteRecords(state.db, 'answers', answerIdsToDelete);
+  if (deletedActivityIds.size) await deleteRecords(state.db, 'activities', [...deletedActivityIds]);
+  if (state.currentActivity && deletedActivityIds.has(state.currentActivity.id)) {
+    state.currentActivity = null;
+    state.activityAnswers.clear();
+    clearInterval(state.activityTimer);
+  } else if (state.currentActivity && updatedActivities.some(activity => activity.id === state.currentActivity.id)) {
+    state.currentActivity = updatedActivities.find(activity => activity.id === state.currentActivity.id);
+    for (const id of allQuestionIds) state.activityAnswers.delete(id);
+  }
+  clearAssetUrlCache();
+  await refreshData(!quiet);
+  if (!quiet && state.page === 'bank') renderPackageHistory();
+  if (!quiet && state.page === 'settings') await renderSettings();
+  if (!quiet) toast(`Pacote excluído. ${removedQuestions.length} questões removidas do banco.`);
+  return true;
+}
+
+async function deleteImportPackage(key) {
+  return deletePackageContents(key);
+}
+
+async function deleteImportPackageFromRecord(id) {
+  const record = state.data.imports.find(item => item.id === id);
+  if (!record) return toast('Registro de importação não encontrado.');
+  return deleteImportPackage(String(record.packageId || record.id));
+}
+
+// Remove orphaned questions left by older versions when a package history was
+// deleted without deleting its questions. The local change journal retains the
+// original import records, so this also handles packages removed previously.
+async function cleanupPreviouslyDeletedPackages() {
+  const { changes } = await getChangesSnapshot(state.db, 0);
+  const importStates = new Map();
+  const collectionRecords = new Map();
+  for (const change of changes) {
+    if (change.table === 'imports') {
+      const current = importStates.get(String(change.id)) || { action: null, record: null };
+      current.action = change.action;
+      if (change.action === 'upsert' && change.record) current.record = change.record;
+      importStates.set(String(change.id), current);
+    } else if (change.table === 'collections') {
+      const current = collectionRecords.get(String(change.id)) || { action: null, record: null };
+      current.action = change.action;
+      if (change.action === 'upsert' && change.record) current.record = change.record;
+      collectionRecords.set(String(change.id), current);
+    }
+  }
+
+  const activePackageKeys = new Set(state.data.imports.map(record => String(record.packageId || record.id)));
+  const deletedPackages = new Map();
+  for (const [recordId, entry] of importStates) {
+    if (entry.action !== 'delete' || !entry.record) continue;
+    const record = entry.record;
+    const key = String(record.packageId || record.id || recordId);
+    if (activePackageKeys.has(key)) continue;
+    const group = deletedPackages.get(key) || { packageId: record.packageId || null, records: [], questionIds: new Set() };
+    group.records.push(record);
+    (Array.isArray(record.questionIds) ? record.questionIds : []).forEach(id => group.questionIds.add(String(id)));
+    deletedPackages.set(key, group);
+  }
+  for (const entry of collectionRecords.values()) {
+    const collection = entry.record;
+    if (!collection || collection.type !== 'sourceExam' || !collection.packageId) continue;
+    const group = deletedPackages.get(String(collection.packageId));
+    if (!group) continue;
+    [...(collection.questionIds || []), ...(collection.originalOrder || [])].forEach(id => group.questionIds.add(String(id)));
+  }
+
+  let removed = 0;
+  for (const [key, group] of deletedPackages) {
+    const ids = group.questionIds;
+    const hasQuestion = [...ids].some(id => Boolean(questionById(id)));
+    const hasImportReference = state.data.imports.some(record => Array.isArray(record.questionIds) && record.questionIds.some(id => ids.has(String(id))));
+    const hasCollectionReference = state.data.collections.some(collection =>
+      (collection.type === 'sourceExam' && String(collection.packageId || '') === key) ||
+      [...(collection.questionIds || []), ...(collection.originalOrder || [])].some(id => ids.has(String(id)))
+    );
+    const hasActiveTaskReference = state.data.activities.some(activity => ['pending', 'running', 'paused'].includes(activity.status) && (activity.questionIds || []).some(id => ids.has(String(id))));
+    const hasReviewReference = state.data.reviews.some(review => ids.has(String(review.questionId)));
+    const hasAliasReference = state.data.aliases.some(alias => ids.has(String(alias.questionId)));
+    if (!hasQuestion && !hasImportReference && !hasCollectionReference && !hasActiveTaskReference && !hasReviewReference && !hasAliasReference) continue;
+    const didRemove = await deletePackageContents(key, {
+      records: group.records,
+      packageId: group.packageId,
+      questionIds: [...ids],
+      confirmUser: false,
+      quiet: true
+    });
+    if (didRemove) removed += group.questionIds.size;
+  }
+  return removed;
+}
+function openImportTaskBuilder(key) {
+  const group=findImportGroup(key); if(!group) return toast('Pacote não encontrado.');
+  openTaskBuilderForIds(group.name,group.ids,{type:'package',packageKey:group.key});
+}
+function openCombinedPackageTaskBuilder() {
+  const groups=getImportGroups().filter(group=>state.selectedPackageKeys.has(group.key));
+  const ids=[...new Set(groups.flatMap(group=>group.ids))];
+  if(!ids.length) return toast('Selecione ao menos um pacote com questões disponíveis.');
+  openTaskBuilderForIds(`${groups.length} pacotes selecionados`,ids,{type:'packages',packageKeys:groups.map(group=>group.key)});
+}
+function openTaskBuilderForIds(packageName,allIds,source) {
+  const ids=allIds.filter(id=>questionById(id)); if(!ids.length) return toast('Não há questões disponíveis nesta seleção.');
+  state.importTaskDraft={packageKey:source.packageKey||null,packageName,source,ids,selectedIds:new Set(),manualPage:0};
+  const questions=ids.map(id=>questionById(id)).filter(Boolean);
+  const areas=[...new Set(questions.map(q=>q.area).filter(Boolean))].sort();
+  const subjects=[...new Set(questions.map(q=>q.subject).filter(Boolean))].sort();
+  const topics=[...new Set(questions.flatMap(q=>topicValues(q)))].sort((a,b)=>a.localeCompare(b,'pt-BR'));
+  const options=(values,label)=>`<option value="">${label}</option>${values.map(value=>`<option value="${safeAttr(value)}">${escapeHTML(value)}</option>`).join('')}`;
+  const body=`<div class="task-builder-intro"><b>${ids.length} questões disponíveis</b><span>${escapeHTML(packageName)}</span></div><label class="field-label">Nome da tarefa<input id="packageTaskTitle" maxlength="100" value="${safeAttr(`Pacote · ${packageName}`)}"/></label><div class="field-grid package-task-filters"><label><span>Modo de seleção</span><select id="packageTaskMode"><option value="all">Todas as questões disponíveis</option><option value="random">Quantidade aleatória</option><option value="manual">Selecionar manualmente</option></select></label><label><span>Área</span><select id="packageTaskArea">${options(areas,'Todas as áreas')}</select></label><label><span>Matéria</span><select id="packageTaskSubject">${options(subjects,'Todas as matérias')}</select></label><label><span>Assunto / subassunto</span><select id="packageTaskTopic">${options(topics,'Todos os assuntos')}</select></label><label><span>Dificuldade</span><select id="packageTaskDifficulty"><option value="">Todas</option><option>Fácil</option><option>Média</option><option>Difícil</option></select></label></div><label class="field-label hidden" id="packageTaskQuantityWrap"><span>Quantidade de questões aleatórias</span><input id="packageTaskQuantity" type="number" min="1" max="${ids.length}" value="${Math.min(20,ids.length)}"/></label><div class="task-manual-controls hidden" id="packageTaskManualControls"><div><b>Seleção manual</b><small id="packageTaskSelectionCount">0 selecionadas</small></div><div class="inline-actions"><button class="text-button" type="button" data-action="task-select-visible">Selecionar página</button><button class="text-button" type="button" data-action="task-clear-selection">Limpar seleção</button></div><div id="packageTaskQuestionList" class="task-question-list"></div><div class="task-list-pagination" id="packageTaskPagination"></div></div><label class="check-row"><input id="packageTaskShuffle" type="checkbox"/><span><b>Embaralhar a ordem das questões</b></span></label><div class="task-selection-summary" id="packageTaskSummary">Todas as questões do pacote serão incluídas.</div>`;
+  openModal('Criar tarefa a partir do pacote',body,`<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button secondary" data-action="resolve-import-task">Resolver agora ↗</button><button class="button primary" data-action="save-import-task">Adicionar às tarefas</button>`,'GERADOR DE TAREFAS');
+  renderImportTaskBuilder();
+}
+function taskBuilderCandidates() {
+  const draft=state.importTaskDraft; if(!draft) return [];
+  const area=$('#packageTaskArea')?.value||'',subject=$('#packageTaskSubject')?.value||'',topic=$('#packageTaskTopic')?.value||'',difficulty=$('#packageTaskDifficulty')?.value||'';
+  return draft.ids.map(id=>questionById(id)).filter(Boolean).filter(q=>(!area||q.area===area)&&(!subject||q.subject===subject)&&(!topic||topicValues(q).some(value=>normalizeSearch(value)===normalizeSearch(topic)))&&(!difficulty||q.difficulty===difficulty));
+}
+function renderImportTaskBuilder() {
+  const draft=state.importTaskDraft; if(!draft||!$('#packageTaskMode')) return;
+  const candidates=taskBuilderCandidates();
+  const mode=$('#packageTaskMode').value;
+  $('#packageTaskQuantityWrap').classList.toggle('hidden',mode!=='random');
+  $('#packageTaskManualControls').classList.toggle('hidden',mode!=='manual');
+  const max=candidates.length;
+  const quantity=$('#packageTaskQuantity'); if(quantity){quantity.max=String(max);quantity.value=String(Math.min(Math.max(1,Number(quantity.value)||1),Math.max(1,max)));}
+  const selected=[...draft.selectedIds].filter(id=>draft.ids.includes(id));
+  $('#packageTaskSelectionCount').textContent=`${selected.length} selecionadas`;
+  const pageSize=50; const pageCount=Math.max(1,Math.ceil(candidates.length/pageSize)); draft.manualPage=Math.min(draft.manualPage,pageCount-1);
+  const visible=candidates.slice(draft.manualPage*pageSize,(draft.manualPage+1)*pageSize);
+  $('#packageTaskQuestionList').innerHTML=visible.map(q=>`<label class="task-question-choice"><input type="checkbox" data-package-task-question="${safeAttr(q.id)}" ${draft.selectedIds.has(q.id)?'checked':''}/><span><b>${escapeHTML(q.id)} · ${escapeHTML(q.subject||q.area)}</b><small>${escapeHTML(q.primaryTopic||'Sem assunto')} · ${escapeHTML(q.difficulty||'Sem nível')}</small><small>${escapeHTML(String(q.statement||'').slice(0,120))}${String(q.statement||'').length>120?'…':''}</small></span></label>`).join('')||'<div class="empty-inline">Nenhuma questão corresponde aos filtros.</div>';
+  $('#packageTaskPagination').innerHTML=pageCount>1?`<button class="button small secondary" data-task-manual-page="${Math.max(0,draft.manualPage-1)}" ${draft.manualPage===0?'disabled':''}>Anterior</button><span>Página ${draft.manualPage+1} de ${pageCount}</span><button class="button small secondary" data-task-manual-page="${Math.min(pageCount-1,draft.manualPage+1)}" ${draft.manualPage===pageCount-1?'disabled':''}>Próxima</button>`:'';
+  const count=mode==='manual'?selected.length:mode==='random'?Math.min(Number(quantity?.value)||1,max):max;
+  $('#packageTaskSummary').textContent=mode==='manual'?`${count} questões selecionadas de ${max} disponíveis.`:mode==='random'?`${count} questões serão sorteadas entre ${max} disponíveis.`:`${count} questões serão incluídas nesta tarefa.`;
+  $('#modalFooter button[data-action="save-import-task"],#modalFooter button[data-action="resolve-import-task"]').forEach(button=>button.disabled=count===0);
+}
+function resolveImportTaskIds() {
+  const draft=state.importTaskDraft; if(!draft) return [];
+  const candidates=taskBuilderCandidates(); const mode=$('#packageTaskMode').value;
+  let ids=mode==='manual'?[...draft.selectedIds].filter(id=>draft.ids.includes(id)):candidates.map(q=>q.id);
+  if(mode==='random') ids=randomize(ids).slice(0,Math.min(Number($('#packageTaskQuantity').value)||1,ids.length));
+  if($('#packageTaskShuffle').checked) ids=randomize(ids);
+  return [...new Set(ids)];
+}
+async function saveImportTask(resolveNow=false) {
+  const ids=resolveImportTaskIds(); if(!ids.length) return toast('Selecione ao menos uma questão para a tarefa.');
+  const title=String($('#packageTaskTitle').value||'Tarefa de questões importadas').trim().slice(0,100)||'Tarefa de questões importadas';
+  const source=state.importTaskDraft.source || {type:'package',packageKey:state.importTaskDraft.packageKey};
+  state.importTaskDraft=null; closeModal();
+  if(resolveNow) return createActivityFromIds(ids,title);
+  await createPendingTaskFromIds(ids,title,source);
+}
+function renderPendingTasks() {
+  const pending=state.data.activities.filter(item=>item.status==='pending').sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
+  const section=$('#pendingTaskSection'); if(!section) return;
+  section.classList.toggle('hidden',pending.length===0 || state.currentActivity?.status==='running');
+  $('#pendingTaskCount').textContent=String(pending.length);
+  $('#pendingTaskEmpty').classList.toggle('hidden',pending.length>0);
+  $('#pendingTaskList').innerHTML=pending.map(task=>`<article class="pending-task-item"><div><b>${escapeHTML(task.title)}</b><small>${task.questionIds.length} questões · Criada em ${formatDate(task.createdAt,true)}</small><small>${escapeHTML(task.source?.type==='package'?'Origem: pacote importado':task.source?.type==='packages'?'Origem: seleção de pacotes':'Origem: recomendações de estudo')}</small></div><div class="inline-actions"><button class="button small primary" data-action="start-pending-task" data-id="${safeAttr(task.id)}">Resolver</button><button class="button small secondary" data-action="delete-pending-task" data-id="${safeAttr(task.id)}">Excluir</button></div></article>`).join('');
+}
+async function createPendingTaskFromIds(ids,title,source={type:'manual'}) {
+  const validIds=[...new Set(ids.filter(id=>questionById(id)))]; if(!validIds.length) return toast('Nenhuma questão disponível para criar a tarefa.');
+  const task={id:makeId('activity'),title,questionIds:validIds,status:'pending',createdAt:nowISO(),source,config:{correctionMode:'end',showErrors:false,commentMode:'available',navigationMode:'free',timerEnabled:false,timerMinutes:90,negativeScoring:false,strategy:'saved-task'}};
+  await putRecord(state.db,'activities',task); await refreshData(); pageNavigate('activity'); toast(`Tarefa adicionada com ${validIds.length} questões.`);
+}
+async function startPendingTask(id) {
+  const pending=state.data.activities.find(item=>item.id===id&&item.status==='pending'); if(!pending) return;
+  const running=state.data.activities.find(item=>item.status==='running');
+  if(running){state.currentActivity=running;await loadActivityAnswers(running.id);pageNavigate('activity');return toast('Conclua ou retome a atividade em andamento antes de iniciar outra.');}
+  const started={...pending,status:'running',startedAt:nowISO(),activeSince:nowISO(),elapsedSecs:0,updatedAt:nowISO()};
+  await putRecord(state.db,'activities',started); state.currentActivity=started; state.activityStart=Date.now();
+  await refreshData(); await loadActivityAnswers(started.id); pageNavigate('activity'); renderSession(); startActivityTimer();
+}
+async function deletePendingTask(id) {
+  const task=state.data.activities.find(item=>item.id===id&&item.status==='pending'); if(!task) return;
+  if(!confirm(`Excluir a tarefa "${task.title}"? As questões do banco serão preservadas.`)) return;
+  await deleteRecord(state.db,'activities',id); await refreshData(); toast('Tarefa removida; as questões continuam no banco.');
+}
+async function createPendingTopicTask(subject,topic) {
+  const ids=state.data.questions.filter(question=>(question.subject||question.area||'Conteúdo')===subject&&topicValues(question).some(value=>normalizeSearch(value)===normalizeSearch(topic))).map(question=>question.id);
+  if(!ids.length) return toast('Não há questões disponíveis para esse assunto.');
+  await createPendingTaskFromIds(ids,`Reforço · ${topic}`,{type:'recommendation',subject,topic});
+}
+function importRecordQuestionIds(item) {
+  const direct = Array.isArray(item?.questionIds) ? item.questionIds : [];
+  const sourceExam = item?.packageId ? state.data.collections.find(collection => collection.type === 'sourceExam' && collection.packageId === item.packageId) : null;
+  const fallback = sourceExam?.originalOrder?.length ? sourceExam.originalOrder : (sourceExam?.questionIds || []);
+  return [...new Set((direct.length ? direct : fallback).filter(id => Boolean(questionById(id))))];
 }
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes)) return '—';
@@ -640,14 +1685,53 @@ function formatBytes(bytes) {
 
 async function openQuestionDetail(id) {
   const question = questionById(id); if (!question) return toast('Questão não encontrada.');
-  const textBase = state.data.textBases.find(item => item.id === question.textBaseId);
+  const textBase = textBaseById(question.textBaseId);
   let expected = getExpectedAnswer(question);
   const answerLabel = question.type === 'multiple_choice' ? `${expected}) ${question.alternatives?.[expected] || ''}` : expected;
   const alternatives = question.type === 'multiple_choice' ? Object.entries(question.alternatives || {}).map(([key,value]) => `<div class="answer-option"><div class="option-content"><b>${escapeHTML(key)})</b> ${richText(value)}${renderOptionImages(question,key)}</div></div>`).join('') : question.type === 'assertion_set' ? question.statements.map((item,index) => `<p><b>${index+1}.</b> ${richText(item.text)}</p>`).join('') : question.type === 'true_false' ? '<div class="answer-options"><div class="answer-option"><span><b>V</b> — Verdadeiro</span></div><div class="answer-option"><span><b>F</b> — Falso</span></div></div>' : '';
   const beforeStemHtml = `${renderQuestionImages(question,['after_text_base'])}${renderQuestionTables(question,['after_text_base'])}${renderQuestionEquations(question,['after_text_base'])}${renderQuestionImages(question,['before_statement','before-statement'])}`;
   const afterStemHtml = `${renderQuestionImages(question,['statement','enunciado','after_statement','after-statement'])}${renderQuestionTables(question,['statement','after_statement'])}${renderQuestionEquations(question,['statement','after_statement'])}`;
-  openModal(question.id, `<div class="question-meta"><span class="tag peach">${escapeHTML(question.area)}</span><span class="tag">${escapeHTML(question.subject)}</span><span class="tag">${escapeHTML(question.primaryTopic)}</span><span class="tag">${escapeHTML(question.difficulty || 'Sem nível')}</span>${(question.relatedSubjects||[]).map(subject=>`<span class="tag">Interdisciplinar: ${escapeHTML(subject)}</span>`).join('')}${question.classificationConfidence != null ? `<span class="tag">Classificação ${Math.round(question.classificationConfidence*100)}% confiança</span>` : ''}</div>${textBase ? `<div class="base-text"><b>${escapeHTML(textBase.title || 'Texto-base')}</b><br>${richText(textBase.content)}</div>` : ''}${beforeStemHtml}<div class="exam-stem">${richText(question.statement)}</div>${afterStemHtml}<div class="answer-options">${alternatives}</div>${renderQuestionImages(question,['after_alternatives'])}${renderQuestionTables(question,['after_alternatives'])}${renderQuestionEquations(question,['after_alternatives'])}<div class="answer-feedback correct"><b>Gabarito: ${escapeHTML(answerLabel)}</b>${question.explanation ? `<p>${richText(question.explanation)}</p>` : '<p>Esta questão possui somente o gabarito, sem resolução comentada.</p>'}</div>${question.alternativeExplanations && Object.keys(question.alternativeExplanations).length ? `<h3>Comentários das alternativas</h3>${Object.entries(question.alternativeExplanations).map(([key,value])=>`<p class="fine-print"><b>${escapeHTML(key)}:</b> ${richText(value)}</p>`).join('')}` : ''}<div class="fine-print">Origem: ${escapeHTML(question.source?.name || question.source?.exam || 'Não informada')} · Identificador: ${escapeHTML(question.id)}</div>`, `<button class="button secondary" data-action="question-review" data-id="${safeAttr(id)}">Adicionar revisão</button><button class="button secondary" data-action="edit-question" data-id="${safeAttr(id)}">Editar classificação</button><button class="button primary" data-action="favorite" data-id="${safeAttr(id)}">${question.favorite ? '★ Favorita' : '☆ Favoritar'}</button>`, 'BANCO DE QUESTÕES');
+  const versionHistory = Array.isArray(question.versionHistory) ? question.versionHistory : [];
+  const versionHistoryHtml = versionHistory.length ? `<details class="fine-print" style="margin-top:16px"><summary>Versões anteriores salvas (${versionHistory.length})</summary><div class="issue-list" style="margin-top:10px">${versionHistory.map((version,index)=>`<div class="preview-q"><b>Versão ${index+1} · ${escapeHTML(formatDate(version.archivedAt || version.updatedAt || version.createdAt,true))}</b><p>${escapeHTML(String(version.statement || '').slice(0,220))}${String(version.statement || '').length>220?'…':''}</p><small>${escapeHTML(version.archiveReason || 'Versão anterior')} ${version.replacedByPackage ? `· Pacote: ${escapeHTML(version.replacedByPackage)}` : ''}</small><div class="note-actions"><button class="text-button" data-action="restore-question-version" data-id="${safeAttr(id)}" data-version-index="${index}">Restaurar esta versão</button></div></div>`).join('')}</div></details>` : '';
+  const alternativeCommentKeys = new Set([
+    ...Object.keys(question.alternativeExplanations || {}),
+    ...(question.images || []).map(image => String(image.position || '').trim().match(/^(?:alternative[_-]explanation|alternative[_-]comment):(.+)$/i)?.[1]).filter(Boolean)
+  ].map(key => String(key).trim().toUpperCase()));
+  const alternativeCommentsHtml = [...alternativeCommentKeys].sort().map(key => {
+    const comment = getAlternativeExplanationText(question, key);
+    const images = renderAlternativeExplanationImages(question, key);
+    if (!comment && !images) return '';
+    return `<div class="alternative-comment"><b>Alternativa ${escapeHTML(key)}</b>${comment ? `<p>${richText(comment)}</p>` : ''}${images}</div>`;
+  }).join('');
+  const generalExplanationHtml = question.explanation || renderExplanationImages(question)
+    ? `<div class="answer-feedback correct"><b>Resolução completa</b>${question.explanation ? `<p>${richText(question.explanation)}</p>` : ''}${renderExplanationImages(question)}</div>`
+    : `<div class="answer-feedback correct"><b>Gabarito: ${escapeHTML(answerLabel)}</b></div>`;
+  openModal(question.id, `<div class="question-meta"><span class="tag peach">${escapeHTML(question.area)}</span><span class="tag">${escapeHTML(question.subject)}</span><span class="tag">${escapeHTML(question.primaryTopic)}</span><span class="tag">${escapeHTML(question.difficulty || 'Sem nível')}</span>${(question.relatedSubjects||[]).map(subject=>`<span class="tag">Interdisciplinar: ${escapeHTML(subject)}</span>`).join('')}${question.classificationConfidence != null ? `<span class="tag">Classificação ${Math.round(question.classificationConfidence*100)}% confiança</span>` : ''}</div>${textBase ? `<div class="base-text"><b>${escapeHTML(textBase.title || 'Texto-base')}</b><br>${richText(textBase.content)}</div>` : ''}${beforeStemHtml}<div class="exam-stem">${richText(question.statement)}</div>${afterStemHtml}${renderQuestionReferences(question)}<div class="answer-options">${alternatives}</div>${renderQuestionImages(question,['after_alternatives'])}${renderQuestionTables(question,['after_alternatives'])}${renderQuestionEquations(question,['after_alternatives'])}${generalExplanationHtml}${alternativeCommentsHtml ? `<h3>Comentários das alternativas</h3>${alternativeCommentsHtml}` : ''}${versionHistoryHtml}<div class="fine-print">Origem: ${escapeHTML(question.source?.name || question.source?.exam || 'Não informada')} · Identificador: ${escapeHTML(question.id)}</div>`, `<button class="button secondary" data-action="question-review" data-id="${safeAttr(id)}">Adicionar revisão</button><button class="button secondary" data-action="edit-question" data-id="${safeAttr(id)}">Editar classificação</button><button class="button primary" data-action="favorite" data-id="${safeAttr(id)}">${question.favorite ? '★ Favorita' : '☆ Favoritar'}</button>`, 'BANCO DE QUESTÕES');
   await hydrateAssetImages($('#modalBody'));
+}
+
+async function restoreQuestionVersion(id, versionIndex) {
+  const current = questionById(id);
+  const archived = current?.versionHistory?.[versionIndex];
+  if (!current || !archived) return toast('Esta versão anterior não está mais disponível.');
+  if (!confirm('Restaurar esta versão da questão? A versão atual também será guardada no histórico.')) return;
+  const stamp = nowISO();
+  const { versionHistory: currentHistory = [], ...currentSnapshot } = current;
+  const { archivedAt, archiveReason, replacedByPackage, ...restoredContent } = archived;
+  const historyEntry = { ...currentSnapshot, archivedAt: stamp, archiveReason: 'Versão atual arquivada ao restaurar uma versão anterior' };
+  const updated = {
+    ...restoredContent,
+    id: current.id,
+    createdAt: current.createdAt || restoredContent.createdAt || stamp,
+    updatedAt: stamp,
+    favorite: Boolean(current.favorite || restoredContent.favorite),
+    answerHistory: [...(current.answerHistory || [])],
+    versionHistory: [...currentHistory, historyEntry].slice(-5)
+  };
+  await putRecord(state.db, 'questions', updated);
+  await refreshData();
+  await openQuestionDetail(id);
+  toast('Versão anterior restaurada.');
 }
 async function toggleFavorite(id) {
   const question = questionById(id); if (!question) return;
@@ -663,7 +1747,7 @@ async function addReview(questionId, reason = 'Revisão adicionada manualmente')
 }
 function openEditQuestion(id) {
   const q = questionById(id); if (!q) return;
-  openModal('Editar classificação', `<form id="editQuestionForm" class="modal-form"><label>Área<select name="area">${Object.keys(SUBJECTS).map(area=>`<option ${q.area===area?'selected':''}>${escapeHTML(area)}</option>`).join('')}</select></label><label>Matéria<select name="subject">${Object.values(SUBJECTS).flat().map(subject=>`<option ${q.subject===subject?'selected':''}>${escapeHTML(subject)}</option>`).join('')}</select></label><label>Assunto principal<input name="primaryTopic" value="${safeAttr(q.primaryTopic)}"></label><label>Assuntos secundários (separados por vírgula)<input name="secondaryTopics" value="${safeAttr((q.secondaryTopics||[]).join(', '))}"></label><label>Matérias relacionadas (interdisciplinaridade)<input name="relatedSubjects" value="${safeAttr((q.relatedSubjects||[]).join(', '))}"></label><label>Confiança da classificação (0 a 1)<input name="classificationConfidence" type="number" min="0" max="1" step="0.01" value="${safeAttr(q.classificationConfidence ?? '')}"></label><label>Subassuntos (separados por vírgula)<input name="subtopics" value="${safeAttr((q.subtopics||[]).join(', '))}"></label><label>Conhecimentos necessários (separados por vírgula)<input name="prerequisites" value="${safeAttr((q.prerequisites||[]).join(', '))}"></label><label>Habilidades (separadas por vírgula)<input name="skills" value="${safeAttr((q.skills||[]).join(', '))}"></label><label>Observação sobre a classificação<textarea name="classificationNote">${escapeHTML(q.classificationNote||'')}</textarea></label><label>Dificuldade<select name="difficulty"><option ${q.difficulty==='Fácil'?'selected':''}>Fácil</option><option ${q.difficulty==='Média'?'selected':''}>Média</option><option ${q.difficulty==='Difícil'?'selected':''}>Difícil</option></select></label></form>`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" data-action="save-question-edit" data-id="${safeAttr(id)}">Salvar classificação</button>`);
+  openModal('Editar classificação', `<form id="editQuestionForm" class="modal-form"><label>Área<select name="area">${Object.keys(SUBJECTS).map(area=>`<option ${q.area===area?'selected':''}>${escapeHTML(area)}</option>`).join('')}</select></label><label>Matéria<select name="subject">${Object.values(SUBJECTS).flat().map(subject=>`<option ${q.subject===subject?'selected':''}>${escapeHTML(subject)}</option>`).join('')}</select></label><label>Assunto principal<input name="primaryTopic" value="${safeAttr(q.primaryTopic)}"></label><label>Assuntos secundários (separados por vírgula)<input name="secondaryTopics" value="${safeAttr((q.secondaryTopics||[]).join(', '))}"></label><label>Matérias relacionadas (interdisciplinaridade)<input name="relatedSubjects" value="${safeAttr((q.relatedSubjects||[]).join(', '))}"></label><label>Confiança da classificação (0 a 1)<input name="classificationConfidence" type="number" min="0" max="1" step="0.01" value="${safeAttr(q.classificationConfidence ?? '')}"></label><label>Subassuntos (separados por vírgula)<input name="subtopics" value="${safeAttr((q.subtopics||[]).join(', '))}"></label><label>Conhecimentos necessários (separados por vírgula)<input name="prerequisites" value="${safeAttr((q.prerequisites||[]).join(', '))}"></label><label>Habilidades (separadas por vírgula)<input name="skills" value="${safeAttr((q.skills||[]).join(', '))}"></label><label>Observação sobre a classificação<textarea name="classificationNote">${escapeHTML(q.classificationNote||'')}</textarea></label><label>Dificuldade<select name="difficulty"><option value="" ${!q.difficulty?'selected':''}>Não informada</option><option value="Fácil" ${q.difficulty==='Fácil'?'selected':''}>Fácil</option><option value="Média" ${q.difficulty==='Média'?'selected':''}>Média</option><option value="Difícil" ${q.difficulty==='Difícil'?'selected':''}>Difícil</option></select></label></form>`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" data-action="save-question-edit" data-id="${safeAttr(id)}">Salvar classificação</button>`);
 }
 async function saveQuestionEdit(id) {
   const q = questionById(id); const form = $('#editQuestionForm'); if (!q || !form) return;
@@ -680,7 +1764,7 @@ async function saveQuestionEdit(id) {
 
 function openImportModal() {
   state.importDraft = null;
-  openModal('Importar pacote de questões', `<div class="modal-form"><div class="import-drop"><span class="empty-symbol">{ }</span><b>Arquivo de dados · obrigatório</b><small>Selecione o JSON preparado para o Grafia Questões.</small><input type="file" id="importJsonFile" accept=".json,application/json"></div><div class="import-drop"><span class="empty-symbol">▧</span><b>Arquivo de imagens · opcional</b><small>Selecione o ZIP que contém as imagens referenciadas pelo JSON.</small><input type="file" id="importZipFile" accept=".zip,application/zip"></div><label>Após importar<select id="importMode"><option value="bank">Adicionar ao banco</option><option value="solve">Importar e resolver agora</option></select></label><p class="fine-print">O arquivo JSON deve ter schemaVersion "1.0.0" e uma lista "questions". Se houver imagens, os identificadores e nomes dos arquivos precisam corresponder. A prévia apontará itens incompletos antes de salvar.</p><button class="button secondary" type="button" data-action="download-template">Baixar modelo JSON vazio</button><div id="importPreview"></div></div>`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" id="analyzeImport" type="button">Analisar pacote</button>`, 'IMPORTAÇÃO E VALIDAÇÃO');
+  openModal('Importar pacote de questões', `<div class="modal-form"><div class="import-drop"><span class="empty-symbol">{ }</span><b>Arquivo de dados · obrigatório</b><small>Selecione o JSON preparado para o Grafia Questions.</small><input type="file" id="importJsonFile" accept=".json,application/json"></div><div class="import-drop"><span class="empty-symbol">▧</span><b>Arquivo de imagens · opcional</b><small>Selecione o ZIP que contém as imagens referenciadas pelo JSON.</small><input type="file" id="importZipFile" accept=".zip,application/zip"></div><label>Após importar<select id="importMode"><option value="bank">Adicionar ao banco</option><option value="solve">Importar e resolver agora</option></select></label><p class="fine-print">O arquivo JSON deve ter schemaVersion "1.0.0" e uma lista "questions". Se houver imagens, os identificadores e nomes dos arquivos precisam corresponder. A prévia apontará itens incompletos antes de salvar.</p><button class="button secondary" type="button" data-action="download-template">Baixar modelo JSON vazio</button><div id="importPreview"></div></div>`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" id="analyzeImport" type="button">Analisar pacote</button>`, 'IMPORTAÇÃO E VALIDAÇÃO');
 }
 async function analyzeImport() {
   const json = $('#importJsonFile')?.files?.[0];
@@ -734,18 +1818,37 @@ function validateDraftQuestion(q, draft) {
   for (const image of q.images || []) {
     if (draft.invalidAssetIds?.includes(image.assetId)) issues.push(`Imagem inválida ou corrompida: ${image.fileName || image.assetId}`);
     else if (!draft.assets.some(item => item.id === image.assetId) && !state.data.assets.some(item => item.id === image.assetId)) issues.push(`Imagem ausente: ${image.fileName || image.assetId}`);
+    const alternativeTarget = String(image.position || '').trim().match(/^(?:alternative[_-]explanation|alternative[_-]comment):(.+)$/i);
+    if (alternativeTarget) {
+      const letter = alternativeTarget[1].trim().toUpperCase();
+      if (q.type !== 'multiple_choice' || !Object.prototype.hasOwnProperty.call(q.alternatives || {}, letter)) {
+        issues.push(`Imagem associada a uma alternativa inexistente: ${letter}`);
+      }
+    }
   }
   return issues;
 }
 function renderImportPreview() {
   const draft = state.importDraft; if (!draft) return;
   const issues = draft.questions.map(q => ({ q, issues: validateDraftQuestion(q, draft) })).filter(item => item.issues.length);
-  const conflicts = draft.duplicates.filter(item => item.conflict);
   const cleanCount = draft.questions.length - issues.length;
   const duplicateCount = draft.duplicates.length;
-  const html = `<div class="import-summary"><div><strong>${draft.questions.length}</strong><span>questões lidas</span></div><div><strong>${cleanCount}</strong><span>sem pendências</span></div><div><strong>${draft.assets.length}</strong><span>imagens localizadas</span></div></div><p class="fine-print">Pacote: ${escapeHTML(draft.packageName)} · ${escapeHTML(draft.schemaVersion)} · ${draft.filesFound} arquivos no ZIP. ${duplicateCount} duplicatas identificadas.</p>${issues.length ? `<h3>Questões incompletas (${issues.length})</h3><div class="issue-list">${issues.map(({q,issues: qIssues}) => `<div class="preview-q"><b>${escapeHTML(q.id)} · ${escapeHTML(q.subject || 'Matéria pendente')}</b><p>${escapeHTML(qIssues.join(' · '))}</p><div class="note-actions"><button class="text-button" data-action="edit-import-question" data-id="${safeAttr(q.id)}">Completar</button><button class="text-button" data-action="remove-import-question" data-id="${safeAttr(q.id)}">Excluir do pacote</button></div></div>`).join('')}</div>` : '<div class="issue-item">Todas as questões passaram na verificação básica.</div>'}${duplicateCount ? `<h3>Duplicatas encontradas (${duplicateCount})</h3><div class="issue-list">${draft.duplicates.map(item=>`<div class="preview-q"><b>${escapeHTML(item.incomingId)} → ${escapeHTML(item.existingId)}</b><p>${item.conflict ? 'Os gabaritos divergem. Escolha como resolver.' : 'Os registros podem ser enriquecidos sem criar uma questão separada.'}</p>${item.conflict ? `<label class="field-label">Resolução<select data-duplicate-choice="${safeAttr(item.incomingId)}"><option value="unresolved" ${item.resolution==='unresolved'?'selected':''}>Escolher…</option><option value="keep" ${item.resolution==='keep'?'selected':''}>Manter gabarito existente</option><option value="replace" ${item.resolution==='replace'?'selected':''}>Usar gabarito importado e guardar histórico</option></select></label>` : '<span class="tag peach">Enriquecimento automático</span>'}</div>`).join('')}</div>` : ''}<div class="field-label" style="margin-top:13px">${draft.sourceExam ? `Prova de origem identificada: ${escapeHTML(draft.sourceExam.title || draft.sourceExam.name || 'Simulado / prova')}` : 'Sem prova de origem declarada.'}</div>`;
+  const unresolvedDuplicates = draft.duplicates.some(item => item.resolution === 'unresolved');
+  const duplicateRows = draft.duplicates.map(item => {
+    const identityNote = item.matchType === 'content'
+      ? 'O enunciado e as alternativas coincidem, mas imagens ou texto-base podem ser diferentes. Confira antes de decidir.'
+      : item.conflict ? 'Os gabaritos divergem. Escolha qual versão deve permanecer.'
+      : 'Esta questão já existe no banco e pode ser enriquecida ou substituída.';
+    const informationNote = item.incomingHasLessInfo
+      ? `<p class="fine-print">A versão importada tem menos informações (${item.incomingInfoCount}) que a atual (${item.existingInfoCount}). A substituição continua disponível.</p>`
+      : `<p class="fine-print">Informações identificadas: atual ${item.existingInfoCount} · importada ${item.incomingInfoCount}.</p>`;
+    return `<div class="preview-q"><b>${escapeHTML(item.incomingId)} → ${escapeHTML(item.existingId)}</b><p>${identityNote}</p>${informationNote}<label class="field-label">Como tratar esta questão?<select data-duplicate-choice="${safeAttr(item.incomingId)}">${item.resolution === 'unresolved' ? `<option value="unresolved" selected>Escolha uma ação…</option>` : ''}<option value="enrich" ${item.resolution==='enrich'?'selected':''}>Enriquecer e preservar os dados atuais</option><option value="replace" ${item.resolution==='replace'?'selected':''}>Substituir pela importada, mesmo com menos informações</option><option value="keep" ${item.resolution==='keep'?'selected':''}>Manter a versão atual sem alterações</option></select></label></div>`;
+  }).join('');
+  const lessInfoDuplicates = draft.duplicates.filter(item => item.incomingHasLessInfo).length;
+  const batchReplacementAction = lessInfoDuplicates ? `<div class="note-actions"><button class="text-button" data-action="replace-less-complete-duplicates">Substituir em lote as ${lessInfoDuplicates} versões importadas com menos informações</button></div>` : '';
+  const html = `<div class="import-summary"><div><strong>${draft.questions.length}</strong><span>questões lidas</span></div><div><strong>${cleanCount}</strong><span>sem pendências</span></div><div><strong>${draft.assets.length}</strong><span>imagens localizadas</span></div></div><p class="fine-print">Pacote: ${escapeHTML(draft.packageName)} · ${escapeHTML(draft.schemaVersion)} · ${draft.filesFound} arquivos no ZIP. ${duplicateCount} duplicatas identificadas.</p>${issues.length ? `<h3>Questões incompletas (${issues.length})</h3><div class="issue-list">${issues.map(({q,issues: qIssues}) => `<div class="preview-q"><b>${escapeHTML(q.id)} · ${escapeHTML(q.subject || 'Matéria pendente')}</b><p>${escapeHTML(qIssues.join(' · '))}</p><div class="note-actions"><button class="text-button" data-action="edit-import-question" data-id="${safeAttr(q.id)}">Completar</button><button class="text-button" data-action="remove-import-question" data-id="${safeAttr(q.id)}">Excluir do pacote</button></div></div>`).join('')}</div>` : '<div class="issue-item">Todas as questões passaram na verificação básica.</div>'}${duplicateCount ? `<h3>Questões já existentes (${duplicateCount})</h3>${batchReplacementAction}<div class="issue-list">${duplicateRows}</div>` : ''}<div class="field-label" style="margin-top:13px">${draft.sourceExam ? `Prova de origem identificada: ${escapeHTML(draft.sourceExam.title || draft.sourceExam.name || 'Simulado / prova')}` : 'Sem prova de origem declarada.'}</div>`;
   $('#importPreview').innerHTML = html;
-  $('#modalFooter').innerHTML = `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" data-action="commit-import" ${issues.length || conflicts.some(item=>item.resolution==='unresolved') ? 'disabled' : ''}>${draft.mode === 'solve' ? 'Importar e resolver' : 'Adicionar ao banco'} (${cleanCount})</button>`;
+  $('#modalFooter').innerHTML = `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" data-action="commit-import" ${issues.length || unresolvedDuplicates ? 'disabled' : ''}>${draft.mode === 'solve' ? 'Importar e resolver' : 'Adicionar ao banco'} (${cleanCount})</button>`;
 }
 function editImportQuestion(id) {
   const draft = state.importDraft; const q = draft?.questions.find(item => item.id === id); if (!q) return;
@@ -777,42 +1880,77 @@ function saveImportQuestion(id) {
 }
 function openImportModalShellForDraft() {
   const draft = state.importDraft;
-  openModal('Importar pacote de questões', `<div class="modal-form"><div class="import-drop"><b>${escapeHTML(draft.fileName)}</b><small>Arquivo de dados analisado.</small></div><div class="import-drop"><b>${escapeHTML(draft.imageFileName || 'Nenhum ZIP selecionado')}</b><small>As referências das imagens já foram verificadas.</small></div><label>Após importar<select id="importMode"><option value="bank" ${draft.mode==='bank'?'selected':''}>Adicionar ao banco</option><option value="solve" ${draft.mode==='solve'?'selected':''}>Importar e resolver agora</option></select></label><div id="importPreview"></div></div>`, '', 'IMPORTAÇÃO E VALIDAÇÃO');
+  openModal('Importar pacote de questões', `<div class="modal-form"><div class="import-drop"><b>${escapeHTML(draft.fileName)}</b></div><div class="import-drop"><b>${escapeHTML(draft.imageFileName || 'Nenhum ZIP selecionado')}</b></div><label>Após importar<select id="importMode"><option value="bank" ${draft.mode==='bank'?'selected':''}>Adicionar ao banco</option><option value="solve" ${draft.mode==='solve'?'selected':''}>Importar e resolver agora</option></select></label><div id="importPreview"></div></div>`, '', 'IMPORTAÇÃO E VALIDAÇÃO');
 }
+function buildReplacementQuestion(existing, incoming, packageName) {
+  const stamp = nowISO();
+  const { versionHistory = [], ...previousSnapshot } = existing;
+  const archivedVersion = {
+    ...previousSnapshot,
+    archivedAt: stamp,
+    archiveReason: 'Substituída pela versão importada',
+    replacedByPackage: packageName || ''
+  };
+  const answerHistory = [...(existing.answerHistory || [])];
+  if (existing.answer && incoming.answer && JSON.stringify(existing.answer) !== JSON.stringify(incoming.answer)) {
+    answerHistory.push({ answer: existing.answer, source: existing.source || {}, changedAt: stamp, reason: 'Gabarito anterior à substituição' });
+  }
+  return {
+    ...incoming,
+    id: existing.id,
+    createdAt: existing.createdAt || incoming.createdAt || stamp,
+    updatedAt: stamp,
+    favorite: Boolean(existing.favorite || incoming.favorite),
+    answerHistory,
+    versionHistory: [...versionHistory, archivedVersion].slice(-5)
+  };
+}
+
 async function commitImport() {
   const draft = state.importDraft; if (!draft) return;
   draft.mode = $('#importMode')?.value || draft.mode;
   const issues = draft.questions.map(q=>validateDraftQuestion(q,draft)).filter(items=>items.length);
   if (issues.length) return toast('Ainda existem questões incompletas. Complete ou exclua os itens sinalizados.');
-  if (draft.duplicates.some(item=>item.conflict && item.resolution==='unresolved')) return toast('Resolva os conflitos de gabarito antes de importar.');
-  const incomingById = new Map(draft.questions.map(q=>[q.id,q]));
+  if (draft.duplicates.some(item=>item.resolution==='unresolved')) return toast('Escolha como tratar todas as questões que já existem no banco.');
   const currentById = new Map(state.data.questions.map(q=>[q.id,q]));
   const aliases = [];
   const questionsToWrite = [];
   const newQuestionIds = [];
   const incomingToFinalId = new Map();
+  let addedCount = 0;
+  let enrichedCount = 0;
+  let replacedCount = 0;
+  let keptCount = 0;
   for (const incoming of draft.questions) {
     const duplicate = draft.duplicates.find(item=>item.incomingId===incoming.id);
-    if (!duplicate) { questionsToWrite.push(incoming); newQuestionIds.push(incoming.id); incomingToFinalId.set(incoming.id, incoming.id); continue; }
-    const existing = currentById.get(duplicate.existingId);
-    if (!existing) { questionsToWrite.push(incoming); newQuestionIds.push(incoming.id); incomingToFinalId.set(incoming.id, incoming.id); continue; }
-    if (duplicate.conflict && duplicate.resolution === 'keep') {
-      aliases.push({ alias: incoming.id, questionId: existing.id, updatedAt: nowISO() });
-      newQuestionIds.push(existing.id);
-      incomingToFinalId.set(incoming.id, existing.id);
+    if (!duplicate) {
+      questionsToWrite.push(incoming); newQuestionIds.push(incoming.id); incomingToFinalId.set(incoming.id, incoming.id); addedCount++;
       continue;
     }
-    const enriched = mergeQuestion(existing, incoming);
-    if (duplicate.conflict && duplicate.resolution === 'replace') {
-      enriched.answerHistory = [...(existing.answerHistory || []), { answer: existing.answer, source: existing.source || {}, changedAt: nowISO() }];
-      enriched.answer = incoming.answer;
+    const existing = currentById.get(duplicate.existingId);
+    if (!existing) {
+      questionsToWrite.push(incoming); newQuestionIds.push(incoming.id); incomingToFinalId.set(incoming.id, incoming.id); addedCount++;
+      continue;
     }
-    questionsToWrite.push(enriched);
+    if (duplicate.resolution === 'keep') {
+      if (incoming.id !== existing.id) aliases.push({ alias: incoming.id, questionId: existing.id, updatedAt: nowISO() });
+      newQuestionIds.push(existing.id);
+      incomingToFinalId.set(incoming.id, existing.id);
+      keptCount++;
+      continue;
+    }
+    const updatedQuestion = duplicate.resolution === 'replace'
+      ? buildReplacementQuestion(existing, incoming, draft.packageName)
+      : mergeQuestion(existing, incoming);
+    if (duplicate.resolution === 'replace') replacedCount++;
+    else enrichedCount++;
+    questionsToWrite.push(updatedQuestion);
     if (incoming.id !== existing.id) aliases.push({ alias: incoming.id, questionId: existing.id, updatedAt: nowISO() });
     newQuestionIds.push(existing.id);
     incomingToFinalId.set(incoming.id, existing.id);
   }
-  const importRecord = { id: makeId('import'), packageId: draft.packageId, packageName: draft.packageName, fileName: draft.fileName, imageFileName: draft.imageFileName, operation: draft.mode === 'solve' ? 'Importar e resolver' : 'Importação de questões', importedCount: questionsToWrite.length, status: 'Concluída', createdAt: nowISO(), updatedAt: nowISO() };
+  const packageQuestionIds = [...new Set(newQuestionIds)];
+  const importRecord = { id: makeId('import'), packageId: draft.packageId, packageName: draft.packageName, fileName: draft.fileName, imageFileName: draft.imageFileName, operation: draft.mode === 'solve' ? 'Importar e resolver' : (replacedCount ? 'Importação com substituições' : 'Importação de questões'), importedCount: questionsToWrite.length, addedCount, enrichedCount, replacedCount, keptCount, packageQuestionCount: packageQuestionIds.length, questionIds: packageQuestionIds, status: 'Concluída', createdAt: nowISO(), updatedAt: nowISO() };
   const usedAssetIds = new Set(draft.questions.flatMap(q => (q.images || []).map(image => image.assetId)));
   const usedAssets = draft.assets.filter(asset => usedAssetIds.has(asset.id));
   const usedAssetIdsForBlobs = new Set(usedAssets.map(asset => asset.id));
@@ -849,7 +1987,7 @@ async function commitImport() {
     importStarted.updatedAt = nowISO();
     await writeBatch(state.db, { imports: [importStarted] });
     const mode = draft.mode; state.importDraft = null; closeModal(); if ((draft.assetBlobs || []).length) clearAssetUrlCache(); await refreshData();
-    toast(`${questionsToWrite.length} questões adicionadas ou enriquecidas.`);
+    toast(`Importação concluída: ${addedCount} novas · ${enrichedCount} enriquecidas · ${replacedCount} substituídas · ${keptCount} mantidas.`);
     if (mode === 'solve' && newQuestionIds.length) await createActivityFromIds([...new Set(newQuestionIds)], `Atividade de importação · ${draft.packageName}`);
     else pageNavigate('bank');
   } catch (error) {
@@ -860,7 +1998,9 @@ async function commitImport() {
 }
 
 async function createActivityFromIds(ids, title) {
-  const running = state.data.activities.filter(item => item.status === 'running').sort((a,b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))[0];
+  const storedActivities = await getAll(state.db, 'activities');
+  state.data.activities = storedActivities;
+  const running = storedActivities.filter(item => item.status === 'running').sort((a,b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))[0];
   if (running) {
     state.currentActivity = running;
     await loadActivityAnswers(running.id);
@@ -869,7 +2009,7 @@ async function createActivityFromIds(ids, title) {
     return;
   }
   const validIds = [...new Set(ids.filter(id=>questionById(id)))]; if (!validIds.length) return;
-  const activity = { id: makeId('activity'), title, questionIds: validIds, status: 'running', createdAt: nowISO(), startedAt: nowISO(), config: { correctionMode: 'end', showErrors: false, commentMode: 'available', navigationMode: 'free', timerEnabled: false, timerMinutes: 90, negativeScoring: false, strategy: 'import' } };
+  const activity = { id: makeId('activity'), title, questionIds: validIds, status: 'running', createdAt: nowISO(), startedAt: nowISO(), activeSince: nowISO(), elapsedSecs: 0, config: { correctionMode: 'end', showErrors: false, commentMode: 'available', navigationMode: 'free', timerEnabled: false, timerMinutes: 90, negativeScoring: false, strategy: 'import' } };
   await putRecord(state.db, 'activities', activity); state.currentActivity = activity; state.activityAnswers = new Map(); state.activityStart = Date.now(); await refreshData(); pageNavigate('activity');
 }
 
@@ -890,7 +2030,7 @@ async function saveNote(id = '') {
   await putRecord(state.db, 'notes', record); closeModal(); await refreshData(); toast('Anotação salva.');
 }
 function openCollectionEditor() {
-  openModal('Criar coleção', `<form id="collectionForm" class="modal-form"><label>Nome da coleção<input name="title" required placeholder="Ex.: Questões para revisar"></label><label>Descrição (opcional)<textarea name="description" placeholder="Objetivo desta lista"></textarea></label><p class="fine-print">Depois de criar, você poderá adicionar questões a partir do banco.</p></form>`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" data-action="save-collection">Criar coleção</button>`);
+  openModal('Criar coleção', `<form id="collectionForm" class="modal-form"><label>Nome da coleção<input name="title" required placeholder="Ex.: Questões para revisar"></label><label>Descrição (opcional)<textarea name="description" placeholder="Objetivo desta lista"></textarea></label></form>`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" data-action="save-collection">Criar coleção</button>`);
 }
 async function saveCollection() {
   const form = $('#collectionForm'); const fd = new FormData(form);
@@ -907,12 +2047,17 @@ function openCollection(id) {
 }
 function openAddToCollection(id) {
   const collection = state.data.collections.find(item=>item.id===id); if (!collection) return;
-  openModal('Adicionar questões', `<div class="modal-form"><p class="fine-print">Selecione as questões que deseja incluir em ${escapeHTML(collection.title)}.</p><div class="compact-list">${state.data.questions.map(q=>`<label class="check-row"><input type="checkbox" data-collection-question="${safeAttr(q.id)}" ${(collection.questionIds||[]).includes(q.id)?'checked':''}><span><b>${escapeHTML(q.id)} · ${escapeHTML(q.primaryTopic)}</b><small>${escapeHTML(q.subject)}</small></span></label>`).join('') || '<div class="empty-inline">O banco está vazio.</div>'}</div></div>`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" data-action="save-collection-questions" data-id="${safeAttr(id)}">Salvar seleção</button>`);
+  openModal('Adicionar questões', `<div class="modal-form"><div class="compact-list">${state.data.questions.map(q=>`<label class="check-row"><input type="checkbox" data-collection-question="${safeAttr(q.id)}" ${(collection.questionIds||[]).includes(q.id)?'checked':''}><span><b>${escapeHTML(q.id)} · ${escapeHTML(q.primaryTopic)}</b><small>${escapeHTML(q.subject)}</small></span></label>`).join('') || '<div class="empty-inline">O banco está vazio.</div>'}</div></div>`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button primary" data-action="save-collection-questions" data-id="${safeAttr(id)}">Salvar seleção</button>`);
 }
 async function saveCollectionQuestions(id) {
   const collection = state.data.collections.find(item=>item.id===id); if (!collection) return;
   const ids = $$('[data-collection-question]:checked').map(item=>item.dataset.collectionQuestion);
-  await putRecord(state.db, 'collections', { ...collection, questionIds: ids, updatedAt: nowISO() }); closeModal(); await refreshData(); toast('Coleção atualizada.');
+  const record = { ...collection, questionIds: ids, updatedAt: nowISO() };
+  if (collection.type === 'sourceExam') {
+    const previousOrder = collection.originalOrder?.length ? collection.originalOrder : (collection.questionIds || []);
+    record.originalOrder = [...previousOrder.filter(id => ids.includes(id)), ...ids.filter(id => !previousOrder.includes(id))];
+  }
+  await putRecord(state.db, 'collections', record); closeModal(); await refreshData(); toast('Coleção atualizada.');
 }
 
 function buildBackupRecord(record, table, assetEntries, index) {
@@ -998,18 +2143,20 @@ async function exportQuestionPackage() {
         position: image.position,
         alt: image.alt,
         caption: image.caption,
+        sourceUrl: image.sourceUrl || '',
+        sourceLabel: image.sourceLabel || '',
         kind: image.kind,
         essential: image.essential
       }))
     };
   });
   const relatedExams = state.data.collections.filter(collection => collection.type === 'sourceExam' && (collection.questionIds || []).some(id => questions.some(q => q.id === id)));
-  const pkg = { schemaVersion: '1.0.0', packageId: makeId('package'), packageName: 'Pacote exportado do Grafia Questões', generatedAt: nowISO(), source: { name: 'Grafia Questões', exportedAt: nowISO() }, ...(relatedExams.length === 1 ? { sourceExam: { title: relatedExams[0].title, description: relatedExams[0].description, questionIds: relatedExams[0].questionIds, originalOrder: relatedExams[0].originalOrder } } : {}), questions, textBases: state.data.textBases };
+  const pkg = { schemaVersion: '1.0.0', packageId: makeId('package'), packageName: 'Pacote exportado do Grafia Questions', generatedAt: nowISO(), source: { name: 'Grafia Questions', exportedAt: nowISO() }, ...(relatedExams.length === 1 ? { sourceExam: { title: relatedExams[0].title, description: relatedExams[0].description, questionIds: relatedExams[0].questionIds, originalOrder: relatedExams[0].originalOrder } } : {}), questions, textBases: state.data.textBases };
   const jsonBlob = new Blob([JSON.stringify(pkg,null,2)], {type:'application/json'});
   const zipBlob = entries.length ? await writeZip(entries) : null;
   const stamp = Date.now();
-  downloadBlob(jsonBlob, `grafia-questoes-${stamp}.json`);
-  if (zipBlob) downloadBlob(zipBlob, `grafia-imagens-${stamp}.zip`);
+  downloadBlob(jsonBlob, `grafia-questions-${stamp}.json`);
+  if (zipBlob) downloadBlob(zipBlob, `grafia-questions-imagens-${stamp}.zip`);
   toast(`Exportação preparada: JSON${entries.length ? ' e ZIP de imagens' : ''}.`);
 }
 async function downloadBackup(type) {
@@ -1017,7 +2164,7 @@ async function downloadBackup(type) {
     const { blob, backup } = type === 'full' ? await buildFullBackup() : await buildIncrementalBackup();
     downloadBlob(blob, `grafia-backup-${type}-${Date.now()}.zip`);
     state.pendingBackup = { checkpointSeq: backup.checkpointSeq, type, databaseId: backup.databaseId };
-    openModal('Confirme o arquivo de backup', `<div class="empty-inline"><span class="empty-symbol">⇧</span><b>O arquivo foi preparado para download.</b><p>Depois de verificar que o ZIP foi salvo em seus arquivos, confirme abaixo. Só então o Grafia Questões atualizará o ponto de partida do próximo backup incremental. Se não confirmar, as alterações continuarão incluídas nos próximos backups.</p><span class="tag peach">${type === 'full' ? 'Backup completo' : 'Backup incremental'}</span></div>`, `<button class="button secondary" data-action="close-modal">Ainda não salvei</button><button class="button primary" data-action="confirm-backup-checkpoint">Confirmei que salvei</button>`, 'PROTEÇÃO DOS DADOS');
+    openModal('Confirme o arquivo de backup', `<div class="empty-inline"><span class="empty-symbol">⇧</span><b>O arquivo foi preparado para download.</b><p>Depois de verificar que o ZIP foi salvo em seus arquivos, confirme abaixo. Só então o Grafia Questions atualizará o ponto de partida do próximo backup incremental. Se não confirmar, as alterações continuarão incluídas nos próximos backups.</p><span class="tag peach">${type === 'full' ? 'Backup completo' : 'Backup incremental'}</span></div>`, `<button class="button secondary" data-action="close-modal">Ainda não salvei</button><button class="button primary" data-action="confirm-backup-checkpoint">Confirmei que salvei</button>`, 'PROTEÇÃO DOS DADOS');
   } catch (error) { toast(error.message || 'Não foi possível criar o backup.', 5000); }
 }
 async function confirmBackupCheckpoint() {
@@ -1043,6 +2190,7 @@ async function parseBackup(file) {
   if (backup.backupType === 'full') {
     if (!Number.isSafeInteger(backup.checkpointSeq) || backup.checkpointSeq < 0) throw new Error('O backup completo não contém um checkpoint de integridade válido.');
     if (!backup.records || typeof backup.records !== 'object' || Array.isArray(backup.records)) throw new Error('A estrutura de dados do backup completo está inválida.');
+    if (!Array.isArray(backup.records.topics)) backup.records.topics = [];
     for (const table of STORES) if (!Array.isArray(backup.records[table])) throw new Error(`O backup completo não contém uma lista válida para ${table}.`);
     const blobIds = new Set();
     for (const asset of backup.records.assetBlobs) {
@@ -1184,7 +2332,7 @@ async function downloadTemplate() {
     textBases: [],
     questions: []
   };
-  downloadBlob(new Blob([JSON.stringify(template,null,2)], {type:'application/json'}), 'modelo-pacote-grafia-questoes.json');
+  downloadBlob(new Blob([JSON.stringify(template,null,2)], {type:'application/json'}), 'modelo-pacote-grafia-questions.json');
 }
 async function requestPersistentStorage() {
   if (!navigator.storage?.persist) return toast('Este navegador não oferece solicitação de armazenamento persistente.');
@@ -1198,7 +2346,7 @@ async function clearDatabase() {
   for (const store of STORES) tx.objectStore(store).clear();
   await new Promise((resolve,reject)=>{ tx.oncomplete=resolve; tx.onabort=()=>reject(tx.error); tx.onerror=()=>reject(tx.error); });
   await setSetting(state.db, 'databaseId', crypto.randomUUID());
-  await setSetting(state.db, 'appVersion', '1.0.1');
+  await setSetting(state.db, 'appVersion', '1.5.6');
   state.currentActivity = null; state.activityAnswers.clear();
   clearAssetUrlCache();
   await refreshData(); pageNavigate('home'); toast('Dados locais removidos.');
@@ -1206,11 +2354,196 @@ async function clearDatabase() {
 
 function showSettings() { pageNavigate('settings'); }
 function newActivityFromBuilder() { state.currentActivity = null; clearInterval(state.activityTimer); pageNavigate('activity'); renderActivityBuilder(); }
+async function pauseCurrentActivity() {
+  const activity = state.currentActivity;
+  if (!activity || activity.status !== 'running') return;
+  clearInterval(state.activityTimer);
+  const elapsedSecs = activityElapsedSeconds(activity);
+  const paused = { ...activity, status: 'paused', activeSince: null, elapsedSecs, pausedAt: nowISO(), updatedAt: nowISO() };
+  await putRecord(state.db, 'activities', paused);
+  state.data.activities = state.data.activities.map(item => item.id === paused.id ? paused : item);
+  state.currentActivity = null;
+  state.activityAnswers.clear();
+  state.activityStart = null;
+  await refreshData(false);
+  pageNavigate('activity');
+  toast('Atividade salva. Você pode criar outra ou continuar esta depois.');
+}
+async function resumeSavedActivity(id) {
+  const activity = state.data.activities.find(item => item.id === id && item.status === 'paused');
+  if (!activity) return toast('Esta atividade salva não está mais disponível.');
+  const running = state.data.activities.find(item => item.status === 'running' && item.id !== id);
+  if (running) {
+    state.currentActivity = running;
+    await loadActivityAnswers(running.id);
+    pageNavigate('activity');
+    return toast('Salve ou conclua a atividade aberta antes de retomar outra.');
+  }
+  const resumed = { ...activity, status: 'running', activeSince: nowISO(), resumedAt: nowISO(), updatedAt: nowISO() };
+  await putRecord(state.db, 'activities', resumed);
+  state.currentActivity = resumed;
+  await refreshData(false);
+  await loadActivityAnswers(resumed.id);
+  pageNavigate('activity');
+  startActivityTimer();
+}
+async function deleteSavedActivity(id) {
+  const activity = state.data.activities.find(item => item.id === id && item.status === 'paused');
+  if (!activity) return;
+  if (!confirm(`Excluir a atividade salva "${activity.title || 'Atividade'}"? As respostas e marcações dessa atividade serão apagadas, mas as questões continuarão no banco.`)) return;
+  const relatedAnswers = state.data.answers.filter(item => item.activityId === id).map(item => item.id);
+  if (relatedAnswers.length) await deleteRecords(state.db, 'answers', relatedAnswers);
+  await deleteRecord(state.db, 'activities', id);
+  await refreshData(false);
+  renderActivityBuilder();
+  toast('Atividade salva excluída. As questões continuam no banco.');
+}
+async function discardCurrentActivity() {
+  const activity = state.currentActivity;
+  if (!activity || activity.status !== 'running') return;
+  if (!confirm('Descartar esta atividade? As respostas, grifos e marcações de alternativas desta sessão serão apagadas. Ela não entrará nas estatísticas nem no histórico de atividades concluídas.')) return;
+  clearInterval(state.activityTimer);
+  const savedAnswers = await getAll(state.db, 'answers');
+  const related = savedAnswers.filter(item => item.activityId === activity.id);
+  for (const answer of related) await deleteRecord(state.db, 'answers', answer.id);
+  await putRecord(state.db, 'activities', { ...activity, status: 'discarded', discardedAt: nowISO(), updatedAt: nowISO() });
+  state.currentActivity = null;
+  state.activityAnswers.clear();
+  state.activityStart = null;
+  await refreshData();
+  pageNavigate('activity');
+  toast('Atividade descartada. Você já pode montar outra.');
+}
+function getTextPoint(root, offset) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node; let consumed = 0;
+  while ((node = walker.nextNode())) {
+    const end = consumed + node.nodeValue.length;
+    if (offset <= end) return { node, offset: Math.max(0, offset - consumed) };
+    consumed = end;
+  }
+  return null;
+}
+function wrapTextRange(root, start, end) {
+  const startPoint = getTextPoint(root, start);
+  const endPoint = getTextPoint(root, end);
+  if (!startPoint || !endPoint || end <= start) return;
+  const range = document.createRange();
+  range.setStart(startPoint.node, startPoint.offset);
+  range.setEnd(endPoint.node, endPoint.offset);
+  const mark = document.createElement('mark');
+  mark.className = 'text-highlight';
+  mark.appendChild(range.extractContents());
+  range.insertNode(mark);
+}
+function applyTextMarks(root, marks = [], target = 'statement') {
+  if (!root || !marks?.length) return;
+  [...marks].filter(mark => (mark.target || 'statement') === target && Number.isFinite(mark.start) && Number.isFinite(mark.end) && mark.end > mark.start)
+    .sort((a,b) => b.start - a.start).forEach(mark => wrapTextRange(root, mark.start, mark.end));
+}
+let pendingTextSelection = null;
+function hideTextSelectionToolbar() {
+  const toolbar = $('#textSelectionToolbar');
+  if (toolbar) toolbar.classList.add('hidden');
+  pendingTextSelection = null;
+}
+function updateTextSelectionToolbar() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || !selection.rangeCount || !state.currentActivity || state.currentActivity.status !== 'running') return hideTextSelectionToolbar();
+  const range = selection.getRangeAt(0);
+  const ancestor = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? range.commonAncestorContainer : range.commonAncestorContainer.parentElement;
+  const root = ancestor?.closest?.('.exam-stem, .base-content');
+  if (!root || !root.contains(range.startContainer) || !root.contains(range.endContainer)) return hideTextSelectionToolbar();
+  const selectedText = selection.toString().trim();
+  if (!selectedText) return hideTextSelectionToolbar();
+  const prefix = range.cloneRange();
+  prefix.selectNodeContents(root);
+  prefix.setEnd(range.startContainer, range.startOffset);
+  const throughEnd = range.cloneRange();
+  throughEnd.selectNodeContents(root);
+  throughEnd.setEnd(range.endContainer, range.endOffset);
+  const start = prefix.toString().length;
+  const end = throughEnd.toString().length;
+  if (end <= start) return hideTextSelectionToolbar();
+  const card = root.closest('[data-question-card]');
+  const questionId = card?.dataset.questionCard;
+  if (!questionId) return hideTextSelectionToolbar();
+  const target = root.matches('.base-content') ? 'textBase' : 'statement';
+  const answer = state.activityAnswers.get(questionId) || {};
+  const marks = (answer.highlights || []).filter(mark => (mark.target || 'statement') === target);
+  const overlaps = marks.some(mark => start < mark.end && end > mark.start);
+  pendingTextSelection = { questionId, target, start, end, text: selectedText, remove: overlaps };
+  const toolbar = $('#textSelectionToolbar');
+  const button = toolbar?.querySelector('button');
+  if (!toolbar || !button) return;
+  button.textContent = overlaps ? 'Remover grifo' : 'Grifar trecho';
+  const rect = range.getBoundingClientRect();
+  const width = toolbar.offsetWidth || 150;
+  toolbar.style.left = `${Math.max(10, Math.min(window.innerWidth - width - 10, rect.left))}px`;
+  toolbar.style.top = `${Math.max(10, Math.min(window.innerHeight - 52, rect.bottom + 8))}px`;
+  toolbar.classList.remove('hidden');
+}
+async function toggleTextHighlight() {
+  const selected = pendingTextSelection;
+  if (!selected || !state.currentActivity) return;
+  const question = questionById(selected.questionId);
+  if (!question) return hideTextSelectionToolbar();
+  const old = state.activityAnswers.get(selected.questionId) || { id: `${state.currentActivity.id}::${selected.questionId}`, activityId: state.currentActivity.id, questionId: selected.questionId, response: '' };
+  const marks = [...(old.highlights || [])];
+  const target = selected.target || 'statement';
+  const nextMarks = selected.remove
+    ? marks.filter(mark => (mark.target || 'statement') !== target || !(selected.start < mark.end && selected.end > mark.start))
+    : [...marks, { target, start: selected.start, end: selected.end, text: selected.text }].sort((a,b) => a.start - b.start);
+  const next = { ...old, highlights: nextMarks, updatedAt: nowISO() };
+  await putRecord(state.db, 'answers', next);
+  syncAnswerCache(next);
+  const selector = target === 'textBase' ? `[data-textbase-for="${CSS.escape(selected.questionId)}"]` : `[data-statement-for="${CSS.escape(selected.questionId)}"]`;
+  const root = $(selector);
+  if (root) {
+    root.innerHTML = target === 'textBase'
+      ? richText(textBaseById(question.textBaseId)?.content || '')
+      : questionStatementHTML(question.statement);
+    applyTextMarks(root, nextMarks, target);
+  }
+  hideTextSelectionToolbar();
+  window.getSelection()?.removeAllRanges();
+}
+async function toggleDimmedOption(questionId, option) {
+  if (!state.currentActivity || state.currentActivity.status !== 'running') return;
+  const old = state.activityAnswers.get(questionId) || { id: `${state.currentActivity.id}::${questionId}`, activityId: state.currentActivity.id, questionId, response: '' };
+  const options = new Set(old.dimmedOptions || old.eliminatedOptions || []);
+  const canonical = String(option).toUpperCase();
+  if (options.has(canonical)) options.delete(canonical); else options.add(canonical);
+  const next = { ...old, dimmedOptions: [...options], eliminatedOptions: undefined, updatedAt: nowISO() };
+  await putRecord(state.db, 'answers', next);
+  syncAnswerCache(next);
+  const question = questionById(questionId);
+  const container = $(`#options-q-${CSS.escape(questionId)}`);
+  if (container && question) {
+    container.outerHTML = renderResponseOptions(question, next.response || '', next, state.currentActivity.config);
+    const card = document.querySelector(`[data-question-card="${CSS.escape(questionId)}"]`);
+    if (card) await hydrateAssetImages(card);
+  }
+}
 
 // Event delegation keeps the interface small and allows pages to be redrawn safely.
 document.addEventListener('click', async event => {
+  if (event.target.closest('#toggleActivityTopicPicker')) { state.activityTopicPickerOpen = !state.activityTopicPickerOpen; renderActivityBuilder(); return; }
+  const saveTopicButton = event.target.closest('[data-save-activity-topic]');
+  if (saveTopicButton) { saveCustomActivityTopic(saveTopicButton.dataset.saveActivityTopic).catch(error => { console.error(error); toast('Não foi possível salvar o assunto.'); }); return; }
+  const areaChip = event.target.closest('[data-activity-area]');
+  if (areaChip) { const value = areaChip.dataset.activityArea; state.activityFilters.areas = state.activityFilters.areas.includes(value) ? state.activityFilters.areas.filter(item => item !== value) : [...state.activityFilters.areas, value]; renderActivityBuilder(); return; }
+  const subjectChip = event.target.closest('[data-activity-subject]');
+  if (subjectChip) { const value = subjectChip.dataset.activitySubject; state.activityFilters.subjects = state.activityFilters.subjects.includes(value) ? state.activityFilters.subjects.filter(item => item !== value) : [...state.activityFilters.subjects, value]; renderActivityBuilder(); return; }
+  const removeTopic = event.target.closest('[data-remove-activity-topic]');
+  if (removeTopic) { const value = removeTopic.dataset.removeActivityTopic; state.activityFilters.topics = state.activityFilters.topics.filter(item => normalizeSearch(item) !== normalizeSearch(value)); renderActivityBuilder(); return; }
+  if (!event.target.closest('#textSelectionToolbar') && !event.target.closest('.exam-stem, .base-content')) hideTextSelectionToolbar();
   const pageButton = event.target.closest('[data-page]');
   if (pageButton) { event.preventDefault(); pageNavigate(pageButton.dataset.page); return; }
+  const bankTabButton = event.target.closest('[data-bank-tab]');
+  if (bankTabButton) { setBankTab(bankTabButton.dataset.bankTab); if(state.bankTab==='packages') renderPackageHistory(); return; }
+  const manualPageButton = event.target.closest('[data-task-manual-page]');
+  if (manualPageButton && state.importTaskDraft) { state.importTaskDraft.manualPage=Number(manualPageButton.dataset.taskManualPage)||0; renderImportTaskBuilder(); return; }
   const areaButton = event.target.closest('[data-filter-area]');
   if (areaButton) { pageNavigate('bank'); $('#filterArea').value = areaButton.dataset.filterArea; renderBank(); return; }
   const openQuestion = event.target.closest('[data-open-question]');
@@ -1223,7 +2556,15 @@ document.addEventListener('click', async event => {
       const previous = ids.slice(0,targetIndex).find(id=>!answerCount(id));
       if (previous) return toast('Responda às questões anteriores para seguir a navegação sequencial.');
     }
-    document.getElementById(`exam-q-${CSS.escape(jump.dataset.jump)}`)?.scrollIntoView({behavior:'smooth',block:'start'}); return;
+    const targetQuestion = document.getElementById(`exam-q-${CSS.escape(jump.dataset.jump)}`);
+    if (targetQuestion) {
+      $$('.exam-number.current').forEach(button => button.classList.remove('current'));
+      jump.classList.add('current');
+      keepNavigationItemVisible(jump);
+      targetQuestion.scrollIntoView({behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block:'start'});
+      window.setTimeout(scheduleActivityNavigationSync, 360);
+    }
+    return;
   }
   const reviewFilter = event.target.closest('[data-review-filter]');
   if (reviewFilter) { state.reviewFilter = reviewFilter.dataset.reviewFilter; renderReviews(); return; }
@@ -1244,15 +2585,50 @@ document.addEventListener('click', async event => {
       state.importDraft.duplicates = state.importDraft.duplicates.filter(item=>item.incomingId!==actionButton.dataset.id);
       renderImportPreview();
     }
+    else if (action === 'replace-less-complete-duplicates') {
+      const targets = state.importDraft?.duplicates.filter(item=>item.incomingHasLessInfo) || [];
+      targets.forEach(item => { item.resolution = 'replace'; });
+      renderImportPreview();
+      toast(`${targets.length} duplicatas marcadas para substituição. Revise a lista antes de importar.`);
+    }
     else if (action === 'back-import-preview') { closeModal(); openImportModalShellForDraft(); renderImportPreview(); }
     else if (action === 'save-import-question') saveImportQuestion(actionButton.dataset.id);
     else if (action === 'commit-import') await commitImport();
+    else if (action === 'create-activity-from-import' || action === 'create-task-from-record') {
+      const importedPackage = state.data.imports.find(item => item.id === actionButton.dataset.id);
+      if(importedPackage) openImportTaskBuilder(importedPackage.packageId || importedPackage.id);
+    }
+    else if (action === 'create-task-from-package') openImportTaskBuilder(actionButton.dataset.packageKey);
+    else if (action === 'create-combined-package-task') openCombinedPackageTaskBuilder();
+    else if (action === 'print-performance') window.print();
+    else if (action === 'clear-performance-filters') { state.performancePeriod='all'; state.performanceArea=''; state.performanceSubject=''; state.performanceTopic=''; renderPerformance(); }
+    else if (action === 'package-details') openPackageDetails(actionButton.dataset.packageKey);
+    else if (action === 'delete-import-package-from-record') await deleteImportPackageFromRecord(actionButton.dataset.id);
+    else if (action === 'delete-package') await deleteImportPackage(actionButton.dataset.packageKey);
+    else if (action === 'save-import-task') await saveImportTask(false);
+    else if (action === 'resolve-import-task') await saveImportTask(true);
+    else if (action === 'task-select-visible') {
+      const candidates=taskBuilderCandidates(); const page=state.importTaskDraft?.manualPage||0; const visible=candidates.slice(page*50,(page+1)*50);
+      visible.forEach(q=>state.importTaskDraft.selectedIds.add(q.id)); renderImportTaskBuilder();
+    }
+    else if (action === 'task-clear-selection') { state.importTaskDraft?.selectedIds.clear(); renderImportTaskBuilder(); }
+    else if (action === 'start-pending-task') await startPendingTask(actionButton.dataset.id);
+    else if (action === 'view-activity-result') { const activity=state.data.activities.find(item=>item.id===actionButton.dataset.id&&item.status==='completed'); if(activity){state.currentActivity=activity;pageNavigate('activity');await renderResult(activity);} }
+    else if (action === 'delete-pending-task') await deletePendingTask(actionButton.dataset.id);
+    else if (action === 'create-pending-topic-task') await createPendingTopicTask(actionButton.dataset.subject,actionButton.dataset.topic);
+    else if (action === 'clear-package-filters') { $('#packageSearch').value=''; $('#packageStatusFilter').value=''; $('#packageSort').value='recent'; renderPackageHistory(); }
+    else if (action === 'open-package-history') { pageNavigate('bank'); setBankTab('packages'); renderPackageHistory(); }
     else if (action === 'favorite') { closeModal(); await toggleFavorite(actionButton.dataset.id); }
     else if (action === 'question-review') { closeModal(); await addReview(actionButton.dataset.id); }
     else if (action === 'edit-question') openEditQuestion(actionButton.dataset.id);
+    else if (action === 'restore-question-version') await restoreQuestionVersion(actionButton.dataset.id, Number(actionButton.dataset.versionIndex));
     else if (action === 'save-question-edit') await saveQuestionEdit(actionButton.dataset.id);
     else if (action === 'finish-activity') await finishActivity(false);
-    else if (action === 'exit-activity') { pageNavigate('home'); toast('Atividade salva automaticamente. Volte à área Atividades para continuar.'); }
+    else if (action === 'discard-activity') await discardCurrentActivity();
+    else if (action === 'resume-activity') await resumeSavedActivity(actionButton.dataset.id);
+    else if (action === 'delete-saved-activity') await deleteSavedActivity(actionButton.dataset.id);
+    else if (action === 'toggle-text-highlight') await toggleTextHighlight();
+    else if (action === 'exit-activity') await pauseCurrentActivity();
     else if (action === 'mark-review') await toggleReviewMark(actionButton.dataset.id);
     else if (action === 'new-activity') newActivityFromBuilder();
     else if (action === 'review-now') await createActivityFromIds([actionButton.dataset.id], 'Revisão de questão');
@@ -1276,8 +2652,66 @@ document.addEventListener('click', async event => {
   } catch (error) { if (action === 'finish-activity') state.finishingActivityId = null; console.error(error); toast(error.message || 'A operação não pôde ser concluída.', 5500); }
 });
 
+// A second tap on an already selected answer clears it; no separate clear button is needed.
+const answerRadioWasChecked = new WeakMap();
+function findAnswerRadio(target) {
+  const direct = target?.closest?.('input[type="radio"][name^="answer-"]');
+  if (direct) return direct;
+  return target?.closest?.('label')?.querySelector?.('input[type="radio"][name^="answer-"]') || null;
+}
+document.addEventListener('pointerdown', event => {
+  const radio = findAnswerRadio(event.target);
+  if (radio) answerRadioWasChecked.set(radio, radio.checked);
+}, true);
+document.addEventListener('keydown', event => {
+  if (event.key !== ' ' && event.key !== 'Spacebar') return;
+  const radio = findAnswerRadio(event.target);
+  if (radio) answerRadioWasChecked.set(radio, radio.checked);
+}, true);
+document.addEventListener('click', event => {
+  const radio = event.target.closest?.('input[type="radio"][name^="answer-"]');
+  if (!radio) return;
+  const wasAlreadyChecked = answerRadioWasChecked.get(radio) === true;
+  answerRadioWasChecked.delete(radio);
+  if (!wasAlreadyChecked || (state.longPressFiredAt && Date.now() - state.longPressFiredAt < 1500)) return;
+  const card = radio.closest('[data-question-card]');
+  if (!card || !state.currentActivity || state.currentActivity.status !== 'running') return;
+  event.preventDefault();
+  const questionId = card.dataset.questionCard;
+  // Wait until the browser completes radio-button activation/cancellation.
+  setTimeout(() => {
+    if (!radio.isConnected) return;
+    radio.checked = false;
+    saveQuestionResponse(questionId).catch(error => {
+      console.error(error);
+      toast('Não foi possível limpar a resposta.');
+    });
+  }, 0);
+}, true);
+
 document.addEventListener('change', async event => {
   const target = event.target;
+  if(target.matches('[data-package-select]')) {
+    if(target.checked) state.selectedPackageKeys.add(target.dataset.packageSelect); else state.selectedPackageKeys.delete(target.dataset.packageSelect);
+    renderPackageHistory(); return;
+  }
+  if (target.matches('[data-package-task-question]')) {
+    if(target.checked) state.importTaskDraft?.selectedIds.add(target.dataset.packageTaskQuestion);
+    else state.importTaskDraft?.selectedIds.delete(target.dataset.packageTaskQuestion);
+    renderImportTaskBuilder(); return;
+  }
+  if (target.matches('[data-error-reason]')) {
+    const record=state.data.answers.find(answer=>answer.id===target.dataset.answerId);
+    if(record){const updated={...record,errorReason:target.value||null,updatedAt:nowISO()};await putRecord(state.db,'answers',updated);const index=state.data.answers.findIndex(item=>item.id===updated.id);if(index>=0)state.data.answers[index]=updated;if(state.page==='performance')renderPerformance();}
+    return;
+  }
+  if (target.id==='packageTaskMode' || target.id==='packageTaskArea' || target.id==='packageTaskSubject' || target.id==='packageTaskTopic' || target.id==='packageTaskDifficulty' || target.id==='packageTaskQuantity') { if(state.importTaskDraft) { state.importTaskDraft.manualPage=0; renderImportTaskBuilder(); } return; }
+  if (target.id==='packageStatusFilter' || target.id==='packageSort') { renderPackageHistory(); return; }
+  if (target.id==='performancePeriod') { state.performancePeriod=target.value; renderPerformance(); return; }
+  if (target.id==='performanceAreaFilter') { state.performanceArea=target.value; renderPerformance(); return; }
+  if (target.id==='performanceSubjectFilter') { state.performanceSubject=target.value; renderPerformance(); return; }
+  if (target.id==='performanceTopicFilter') { state.performanceTopic=target.value; renderPerformance(); return; }
+  if (target.matches('[data-toggle-activity-topic]')) { toggleActivityTopic(target.dataset.toggleActivityTopic, target.checked); return; }
   if (target.id === 'importJsonFile' || target.id === 'importZipFile') return;
   if (target.matches('[data-restore-conflict]')) { state.restoreChoices[target.dataset.restoreConflict] = target.value; return; }
   if (target.id === 'restoreMode') { renderRestoreConflicts(); return; }
@@ -1297,8 +2731,7 @@ document.addEventListener('change', async event => {
   if (target.id === 'restoreFile' && target.files?.[0]) { await beginRestore(target.files[0]); target.value = ''; return; }
   if (target.id === 'filterArea') { state.bankPage=1; fillSubjectSelect($('#filterSubject'), target.value); renderBank(); }
   if (target.id === 'filterSubject' || target.id === 'filterDifficulty' || target.id === 'filterType' || target.id === 'onlyFavorites') { state.bankPage=1; renderBank(); }
-  if (target.id === 'activityArea') { fillSubjectSelect($('#activitySubject'), target.value); renderActivityBuilder(); }
-  if (target.id === 'activitySubject' || target.id === 'activityDifficulty' || target.id === 'activityTopic' || target.id === 'includeSolved') renderActivityBuilder();
+  if (target.id === 'activityDifficulty' || target.id === 'includeSolved') renderActivityBuilder();
   if (target.id === 'timerEnabled') renderActivityBuilder();
   if (target.id === 'correctionMode') {
     const correctionAtEnd = target.value === 'end';
@@ -1308,11 +2741,51 @@ document.addEventListener('change', async event => {
 });
 
 document.addEventListener('input', event => {
-  if (event.target.id === 'bankSearch') { state.bankPage=1; renderBank(); }
-  if (event.target.id === 'activityTopic') renderActivityBuilder();
+  if(event.target.id==='packageSearch') { clearTimeout(bankSearchTimer); bankSearchTimer=setTimeout(()=>{if(state.page==='bank')renderPackageHistory();},110); }
+  if(event.target.id==='packageTaskTitle' && state.importTaskDraft) return;
+  if(event.target.id==='packageTaskQuantity' && state.importTaskDraft) renderImportTaskBuilder();
+  if (event.target.id === 'bankSearch') { state.bankPage=1; clearTimeout(bankSearchTimer); bankSearchTimer = setTimeout(() => { if (state.page === 'bank') renderBank(); }, 110); }
+  if (event.target.id === 'activityTopicSearch') { state.activityTopicSearch = event.target.value; renderActivityTopicList(); }
 });
+document.addEventListener('keydown', event => {
+  if (event.target.id === 'activityTopicSearch' && event.key === 'Enter') {
+    event.preventDefault();
+    const query = event.target.value.trim();
+    if (!query) return;
+    const normalized = normalizeSearch(query);
+    const exact = buildActivityTopicCatalog().find(item => item.normalized === normalized);
+    if (exact) toggleActivityTopic(exact.label, true);
+    else saveCustomActivityTopic(query).catch(error => { console.error(error); toast('Não foi possível salvar o assunto.'); });
+  }
+});
+document.addEventListener('pointerdown', event => {
+  if (event.target.closest?.('#textSelectionToolbar button')) { event.preventDefault(); return; }
+  const option = event.target.closest?.('[data-hold-option][data-question-option]');
+  if (!option || !state.currentActivity || state.currentActivity.status !== 'running') return;
+  clearTimeout(state.longPressTimer);
+  state.longPressPointerId = event.pointerId;
+  const questionId = option.dataset.questionOption;
+  const key = option.dataset.holdOption;
+  state.longPressTimer = setTimeout(() => {
+    state.longPressFiredAt = Date.now();
+    toggleDimmedOption(questionId, key).catch(error => { console.error(error); toast('Não foi possível marcar a alternativa.'); });
+  }, 1000);
+});
+document.addEventListener('pointerup', event => { if (state.longPressPointerId === event.pointerId) { clearTimeout(state.longPressTimer); state.longPressTimer = null; state.longPressPointerId = null; } if (!event.target.closest?.('#textSelectionToolbar')) setTimeout(updateTextSelectionToolbar, 50); });
+document.addEventListener('pointercancel', () => { clearTimeout(state.longPressTimer); state.longPressTimer = null; state.longPressPointerId = null; });
+document.addEventListener('pointerleave', event => { if (state.longPressPointerId === event.pointerId) { clearTimeout(state.longPressTimer); state.longPressTimer = null; state.longPressPointerId = null; } });
+document.addEventListener('click', event => {
+  if (state.longPressFiredAt && Date.now() - state.longPressFiredAt < 1500 && event.target.closest?.('[data-hold-option]')) {
+    event.preventDefault(); event.stopImmediatePropagation(); state.longPressFiredAt = 0;
+  }
+}, true);
+document.addEventListener('selectionchange', () => { if (state.currentActivity?.status === 'running') setTimeout(updateTextSelectionToolbar, 30); });
+document.addEventListener('touchend', event => { if (!event.target.closest?.('#textSelectionToolbar')) setTimeout(updateTextSelectionToolbar, 0); }, { passive: true });
+document.addEventListener('mousedown', event => { if (event.target.closest?.('#textSelectionToolbar button')) event.preventDefault(); });
 
 document.addEventListener('click', event => {
+  const selectionButton = event.target.closest('#textSelectionToolbar button');
+  if (selectionButton) { event.preventDefault(); return; }
   const amount = event.target.closest('#questionAmount button');
   if (amount) {
     $$('#questionAmount button').forEach(button=>button.classList.toggle('selected',button===amount));
@@ -1331,6 +2804,8 @@ async function initialize() {
   try {
     if (!('indexedDB' in window)) throw new Error('Este navegador não oferece IndexedDB, necessário para armazenar seu banco local.');
     state.db = await openDB();
+    await refreshData(false);
+    await cleanupPreviouslyDeletedPackages();
     await refreshData();
     const running = state.data.activities.filter(item=>item.status==='running').sort((a,b)=>Date.parse(b.startedAt)-Date.parse(a.startedAt))[0];
     if (running) {
@@ -1342,7 +2817,7 @@ async function initialize() {
     }
   } catch (error) {
     console.error(error);
-    openModal('Não foi possível iniciar o banco local', `<p>${escapeHTML(error.message)}</p><p class="fine-print">Abra o Grafia Questões por uma origem HTTPS (como GitHub Pages) ou localhost. Alguns navegadores não permitem armazenamento completo quando o HTML é aberto diretamente como arquivo.</p>`, '', 'INICIALIZAÇÃO');
+    openModal('Não foi possível iniciar o banco local', `<p>${escapeHTML(error.message)}</p><p class="fine-print">Abra o Grafia Questions por uma origem HTTPS (como GitHub Pages) ou localhost. Alguns navegadores não permitem armazenamento completo quando o HTML é aberto diretamente como arquivo.</p>`, '', 'INICIALIZAÇÃO');
   }
 }
 

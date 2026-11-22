@@ -52,6 +52,8 @@ function normalizeQuestion(raw, packageMeta = {}) {
     position: str(item.position ?? item.posicao) || 'statement',
     alt: str(item.alt ?? item.description ?? item.descricao),
     caption: str(item.caption ?? item.legenda),
+    sourceUrl: str(item.sourceUrl ?? item.sourceURL ?? item.url ?? item.href),
+    sourceLabel: str(item.sourceLabel ?? item.source_label ?? item.sourceTitle),
     kind: str(item.kind ?? item.tipo) || 'illustrative',
     essential: item.essential === true || item.essential === 'true' || item.essencial === true || str(item.kind ?? item.tipo).toLowerCase() === 'essential'
   }));
@@ -80,6 +82,8 @@ function normalizeQuestion(raw, packageMeta = {}) {
     equations: Array.isArray(raw.equations ?? raw.formulas) ? (raw.equations ?? raw.formulas).map(item => ({ label: str(item.label ?? item.rotulo), expression: str(item.expression ?? item.latex ?? item.formula ?? item.expressao), position: str(item.position ?? item.posicao) || 'after_statement' })) : [],
     textBaseId: str(raw.textBaseId ?? raw.text_base_id ?? raw.textoBaseId),
     images,
+    links: toArray(raw.links ?? raw.references ?? raw.referencias).map(item => typeof item === 'string' ? item : ({ url: str(item?.url ?? item?.href ?? item?.link), label: str(item?.label ?? item?.title ?? item?.name) })).filter(item => typeof item === 'string' ? item : item.url),
+    sourceUrl: str(raw.sourceUrl ?? raw.sourceURL ?? raw.sourceLink ?? raw.referenceUrl),
     source: raw.source ?? raw.provenance ?? packageMeta.source ?? {},
     errorCategories: toArray(raw.errorCategories ?? raw.categoriasDeErro).map(str).filter(Boolean),
     triParameters: tri && typeof tri === 'object' ? { a: Number(tri.a), b: Number(tri.b), c: Number(tri.c) } : null,
@@ -101,6 +105,35 @@ function questionCoreSignature(question) {
   const opts = Object.entries(question.alternatives || {}).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}:${normalizeSearch(v)}`).join('|');
   const statements = (question.statements || []).map(item => normalizeSearch(item.text)).join('|');
   return `${question.type}::${normalizeSearch(question.statement)}::${opts}::${statements}`;
+}
+
+function countQuestionInformation(question) {
+  const scalarFields = ['area', 'subject', 'primaryTopic', 'difficulty', 'statement', 'answer', 'explanation', 'textBaseId', 'sourceUrl', 'classificationNote'];
+  let count = scalarFields.filter(field => {
+    const value = question[field];
+    return value !== null && value !== undefined && String(value).trim() !== '';
+  }).length;
+  for (const field of ['secondaryTopics', 'relatedSubjects', 'subtopics', 'prerequisites', 'skills', 'errorCategories', 'statements', 'images', 'tables', 'equations', 'links']) {
+    count += Array.isArray(question[field]) ? question[field].length : 0;
+  }
+  count += Object.keys(question.alternatives || {}).length;
+  count += Object.keys(question.alternativeExplanations || {}).length;
+  return count;
+}
+
+async function sameBlobContent(left, right) {
+  if (!left || !right || left.size !== right.size) return false;
+  if (globalThis.crypto?.subtle?.digest) {
+    const digest = async blob => new Uint8Array(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer()));
+    const [a, b] = await Promise.all([digest(left), digest(right)]);
+    return a.length === b.length && a.every((value, index) => value === b[index]);
+  }
+  // Fallback for older secure-context implementations without SubtleCrypto.
+  const [a, b] = await Promise.all([left.arrayBuffer(), right.arrayBuffer()]);
+  if (a.byteLength !== b.byteLength) return false;
+  const aa = new Uint8Array(a); const bb = new Uint8Array(b);
+  for (let index = 0; index < aa.length; index++) if (aa[index] !== bb[index]) return false;
+  return true;
 }
 
 async function detectImageMime(blob) {
@@ -144,6 +177,13 @@ function validateQuestion(question, index, textBaseIds, assetMap, invalidAssetId
     if (invalidAssetIds.has(image.assetId)) issues.push(`O arquivo vinculado à imagem ${image.assetId} não é uma imagem compatível ou está corrompido.`);
     else if (!image.fileName && !assetMap.has(image.assetId)) issues.push(`A imagem ${image.assetId} não possui arquivo identificado.`);
     else if (!assetMap.has(image.assetId)) issues.push(`Arquivo de imagem ausente: ${image.fileName || image.assetId}.`);
+    const alternativeTarget = String(image.position || '').trim().match(/^(?:alternative[_-]explanation|alternative[_-]comment):(.+)$/i);
+    if (alternativeTarget) {
+      const letter = alternativeTarget[1].trim().toUpperCase();
+      if (question.type !== 'multiple_choice' || !Object.prototype.hasOwnProperty.call(question.alternatives || {}, letter)) {
+        issues.push(`A imagem ${image.assetId} aponta para a explicação da alternativa ${letter}, mas essa alternativa não existe nesta questão.`);
+      }
+    }
   }
   question.incomplete = issues.length > 0;
   question.importIssues = issues;
@@ -153,16 +193,16 @@ function validateQuestion(question, index, textBaseIds, assetMap, invalidAssetId
 
 function findAssetFile(files, ref) {
   if (!files?.size) return null;
-  const requested = ref.fileName.replace(/\\/g, '/').replace(/^\.\//, '');
-  if (requested && files.has(requested)) return files.get(requested);
+  const requested = String(ref.fileName || '').replace(/\\/g, '/').replace(/^\.\//, '');
+  if (requested && files.has(requested)) return { path: requested, blob: files.get(requested) };
   const basename = requested.split('/').pop();
-  if (basename) {
-    const matches = [...files.entries()].filter(([path]) => path.split('/').pop() === basename);
-    if (matches.length === 1) return matches[0][1];
-    if (matches.length > 1) return null;
-  }
-  const idMatches = [...files.entries()].filter(([path]) => path.split('/').pop().startsWith(`${ref.assetId}.`));
-  return idMatches.length === 1 ? idMatches[0][1] : null;
+  const byBasename = basename ? [...files.entries()].filter(([path]) => path.split('/').pop() === basename) : [];
+  if (byBasename.length > 1) throw new Error(`Há mais de um arquivo chamado "${basename}" no ZIP. Use caminhos completos e únicos nas referências das imagens.`);
+  if (byBasename.length === 1) return { path: byBasename[0][0], blob: byBasename[0][1] };
+  const byAssetId = [...files.entries()].filter(([path]) => path.split('/').pop().startsWith(`${ref.assetId}.`));
+  if (byAssetId.length > 1) throw new Error(`Há mais de um arquivo associado ao identificador de imagem ${ref.assetId}. Informe o caminho completo no JSON.`);
+  if (byAssetId.length === 1) return { path: byAssetId[0][0], blob: byAssetId[0][1] };
+  return null;
 }
 
 export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
@@ -234,6 +274,7 @@ export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
   const assetBlobs = [];
   const assetMap = new Map();
   const invalidAssetIds = new Set();
+  const usedZipPaths = new Set();
   const storedAssets = await getAll(db, 'assets');
   const storedAssetBlobs = await getAll(db, 'assetBlobs');
   const storedAssetMap = new Map(storedAssets.map(asset => [asset.id, asset]));
@@ -241,9 +282,14 @@ export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
   for (const q of questions) {
     for (const ref of q.images) {
       if (assetMap.has(ref.assetId)) continue;
-      const incomingBlob = findAssetFile(zipFiles, ref);
+      const zipMatch = findAssetFile(zipFiles, ref);
+      const incomingBlob = zipMatch?.blob || null;
+      if (zipMatch) usedZipPaths.add(zipMatch.path);
       const storedMeta = storedAssetMap.get(ref.assetId);
       const storedBlob = storedBlobMap.get(ref.assetId);
+      if (incomingBlob && storedBlob?.blob && !(await sameBlobContent(incomingBlob, storedBlob.blob))) {
+        throw new Error(`O identificador de imagem ${ref.assetId} já existe no banco com outro conteúdo. Use um novo assetId para não substituir imagens usadas por questões existentes.`);
+      }
       const blob = incomingBlob || storedBlob?.blob || null;
       if (blob) {
         const mimeType = await detectImageMime(blob);
@@ -257,6 +303,12 @@ export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
       }
     }
   }
+  const extraZipFiles = [...zipFiles.keys()].filter(path => !usedZipPaths.has(path));
+  if (extraZipFiles.length) {
+    const preview = extraZipFiles.slice(0, 8).join(', ');
+    throw new Error(`O ZIP contém ${extraZipFiles.length} arquivo(s) que não são referenciados por nenhuma imagem do JSON: ${preview}${extraZipFiles.length > 8 ? ', …' : ''}. Remova os arquivos extras ou vincule-os a uma questão.`);
+  }
+
   const incomplete = [];
   questions.forEach((question, index) => {
     const issues = validateQuestion(question, index, textBaseIds, assetMap, invalidAssetIds);
@@ -268,7 +320,21 @@ export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
   const aliasMap = new Map(currentAliases.map(item => [item.alias, item.questionId]));
   const currentById = new Map(currentQuestions.map(item => [item.id, item]));
   const signatureMap = new Map();
-  for (const existing of currentQuestions) if (existing.statement) signatureMap.set(questionSignature(existing), existing);
+  const coreSignatureMap = new Map();
+  const addCandidate = (map, signature, question) => {
+    const matches = map.get(signature) || [];
+    matches.push(question);
+    map.set(signature, matches);
+  };
+  const uniqueCandidate = (map, signature) => {
+    const matches = map.get(signature) || [];
+    return matches.length === 1 ? matches[0] : null;
+  };
+  for (const existing of currentQuestions) {
+    if (!existing.statement) continue;
+    addCandidate(signatureMap, questionSignature(existing), existing);
+    addCandidate(coreSignatureMap, questionCoreSignature(existing), existing);
+  }
   const duplicates = [];
   for (const question of questions) {
     const aliasTarget = aliasMap.get(question.id);
@@ -276,10 +342,21 @@ export async function prepareQuestionImport(db, jsonFile, zipFile = null) {
     if (directMatch && questionCoreSignature(directMatch) !== questionCoreSignature(question)) {
       throw new Error(`O ID ${question.id} já existe no banco, mas o enunciado ou as alternativas são diferentes. Para evitar mesclar questões distintas, gere um ID globalmente único para esta questão e tente novamente.`);
     }
-    const match = directMatch || (question.statement ? signatureMap.get(questionSignature(question)) : null);
+    const exactMatch = question.statement ? uniqueCandidate(signatureMap, questionSignature(question)) : null;
+    const contentMatch = question.statement ? uniqueCandidate(coreSignatureMap, questionCoreSignature(question)) : null;
+    const match = directMatch || exactMatch || contentMatch;
     if (match) {
+      const matchType = directMatch ? 'id' : exactMatch ? 'exact' : 'content';
       const conflict = match.answer && question.answer && JSON.stringify(match.answer) !== JSON.stringify(question.answer);
-      duplicates.push({ incomingId: question.id, existingId: match.id, conflict: Boolean(conflict), incoming: question, existing: match, resolution: conflict ? 'unresolved' : 'enrich' });
+      // A content-only match means the question body is identical but its images/text base
+      // may differ. Require an explicit choice instead of silently merging two variants.
+      const resolution = (conflict || matchType === 'content') ? 'unresolved' : 'enrich';
+      duplicates.push({
+        incomingId: question.id, existingId: match.id, conflict: Boolean(conflict), matchType,
+        existingInfoCount: countQuestionInformation(match), incomingInfoCount: countQuestionInformation(question),
+        incomingHasLessInfo: countQuestionInformation(question) < countQuestionInformation(match),
+        incoming: question, existing: match, resolution
+      });
     }
   }
   const sourceExam = pkg.sourceExam ?? pkg.exam ?? pkg.prova ?? null;
@@ -313,6 +390,8 @@ export function mergeQuestion(existing, incoming) {
       ...previous, ...image,
       alt: image.alt || previous.alt || '',
       caption: image.caption || previous.caption || '',
+      sourceUrl: image.sourceUrl || previous.sourceUrl || '',
+      sourceLabel: image.sourceLabel || previous.sourceLabel || '',
       fileName: image.fileName || previous.fileName || ''
     });
   }
@@ -331,7 +410,13 @@ export function mergeQuestion(existing, incoming) {
   if (incoming.explanation && incoming.explanation.length > String(merged.explanation || '').length) merged.explanation = incoming.explanation;
   merged.alternatives = Object.fromEntries(Object.entries(merged.alternatives).map(([key, value]) => [key, incoming.alternatives?.[key] && incoming.alternatives[key].length > String(value || '').length ? incoming.alternatives[key] : value]));
   merged.alternativeExplanations = Object.fromEntries(Object.entries(merged.alternativeExplanations).map(([key, value]) => [key, incoming.alternativeExplanations?.[key] && incoming.alternativeExplanations[key].length > String(value || '').length ? incoming.alternativeExplanations[key] : value]));
-  if (existing.source || incoming.source) merged.source = { ...(existing.source && typeof existing.source === 'object' ? existing.source : {}), ...(incoming.source && typeof incoming.source === 'object' ? incoming.source : {}) };
+  if (existing.source || incoming.source) {
+    const existingSource = typeof existing.source === 'string' ? { url: existing.source } : (existing.source && typeof existing.source === 'object' && !Array.isArray(existing.source) ? existing.source : {});
+    const incomingSource = typeof incoming.source === 'string' ? { url: incoming.source } : (incoming.source && typeof incoming.source === 'object' && !Array.isArray(incoming.source) ? incoming.source : {});
+    merged.source = { ...existingSource, ...incomingSource };
+  }
+  merged.links = [...new Map([...(existing.links || []), ...(incoming.links || [])].map(item => [JSON.stringify(item), item])).values()];
+  if (!merged.sourceUrl && incoming.sourceUrl) merged.sourceUrl = incoming.sourceUrl;
   merged.updatedAt = new Date().toISOString();
   const sourceHistory = [...(existing.sourceHistory || [existing.source || {}]), ...(incoming.sourceHistory || [incoming.source || {}])];
   merged.sourceHistory = [...new Map(sourceHistory.map(item => [JSON.stringify(item), item])).values()];
