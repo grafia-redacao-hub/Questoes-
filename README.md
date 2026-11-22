@@ -1,10 +1,6 @@
-# Grafia Questões — versão 1.0.0
+# Grafia Questions — versão 1.5.6
 
 Aplicação web progressiva (PWA) para banco pessoal de questões e atividades, com armazenamento local no navegador. O projeto não contém questões de demonstração: o acervo começa vazio e é preenchido por importação.
-
-## Auditoria da versão 1.0.1
-
-Consulte `AUDITORIA_GRAFIA_QUESTOES_v1.0.1.md` para as correções realizadas, riscos ainda conhecidos e verificações executadas.
 
 ## Publicar no GitHub Pages
 
@@ -32,9 +28,9 @@ O fluxo utiliza dois arquivos separados:
 1. JSON obrigatório (`schemaVersion: "1.0.0"`), com questões, alternativas, gabaritos, resoluções, classificação e referências às imagens.
 2. ZIP opcional com as imagens referenciadas no JSON.
 
-Consulte `SCHEMA_PACOTE.md` e `MODELO_PACOTE.json`. O modelo começa com `questions: []`; não é um conjunto de questões fictícias.
+Consulte `SCHEMA_PACOTE.md` e `MODELO_PACOTE.json`. O modelo começa com `questions: []`; não é um conjunto de questões fictícias. As imagens de resoluções gerais e de comentários individuais das alternativas usam o mesmo array `images` e o mesmo ZIP da importação; consulte as posições `explanation` e `alternative_explanation:A` no schema.
 
-A importação verifica a estrutura, IDs estáveis e únicos, referências de imagens, textos-base, correspondência entre área e matéria, questões incompletas e duplicatas. Um ID já existente com enunciado/alternativas diferentes bloqueia a importação para evitar mesclagem acidental. Questões incompletas podem ser editadas ou removidas da importação. Conflitos de gabarito exigem uma escolha explícita. A análise de JSON e ZIP roda em um Web Worker quando o navegador oferece suporte, reduzindo o bloqueio da interface. A gravação ocorre em lotes de até 200 questões e 100 imagens. Se o navegador interromper a operação, reanalise o mesmo par JSON/ZIP para retomar por identificadores e deduplicação; esta versão ainda não usa um cursor de retomada formal. O ZIP é verificado por tamanho e CRC antes de os arquivos serem armazenados.
+A importação verifica a estrutura, IDs estáveis e únicos, referências de imagens, textos-base, correspondência entre área e matéria, questões incompletas e duplicatas. Um `assetId` já existente não pode ser reutilizado para outro arquivo de imagem: o conteúdo é comparado para impedir que questões antigas passem a apontar silenciosamente para uma imagem diferente. Um ID já existente com enunciado/alternativas diferentes bloqueia a importação para evitar mesclagem acidental. Para detectar questões iguais com IDs de imagens ou textos-base diferentes, a comparação também considera o conteúdo do enunciado e das alternativas; quando essa correspondência textual é usada, a importação exige uma decisão manual para evitar unir questões com figuras diferentes. Em cada duplicata, escolha enriquecer, manter a versão atual ou substituir pela versão importada, mesmo que ela tenha menos informações. A substituição preserva os IDs usados por atividades e respostas, mantém favoritos e histórico de respostas, guarda até cinco versões anteriores e permite restaurá-las na tela de detalhes da questão. Questões incompletas podem ser editadas ou removidas da importação. A análise de JSON e ZIP roda em um Web Worker quando o navegador oferece suporte, reduzindo o bloqueio da interface. A gravação ocorre em lotes de até 200 questões e 100 imagens. Se o navegador interromper a operação, reanalise o mesmo par JSON/ZIP para retomar por identificadores e deduplicação; esta versão ainda não usa um cursor de retomada formal. O ZIP é verificado por tamanho e CRC antes de os arquivos serem armazenados.
 
 ## Backups
 
@@ -43,15 +39,19 @@ A importação verifica a estrutura, IDs estáveis e únicos, referências de im
 - **Pacote de questões:** exporta um JSON e, quando necessário, um ZIP opcional de imagens.
 - **Restauração completa:** permite mesclar ou substituir. A substituição dispara antes o download de um backup de segurança e grava os dados em uma transação IndexedDB. Depois de criar qualquer backup, confirme que o arquivo foi salvo antes de avançar o checkpoint incremental; sem essa confirmação, as alterações continuam incluídas no próximo backup.
 
-## Limites conhecidos da versão 1.0.0
+## Limites conhecidos das versões 1.5.x
 
 - A estimativa de proficiência inspirada na TRI é experimental e só aparece com parâmetros `a`, `b` e `c` fornecidos no pacote; não é uma nota oficial do ENEM.
 - A estimativa não deve ser interpretada sem calibração empírica dos parâmetros.
 - Fórmulas são exibidas como expressões textuais; o aplicativo não inclui um renderizador avançado de LaTeX nesta versão.
-- A versão inicial oferece diagnóstico por área/assunto, confiança declarada, tempo total de atividades e estratégias por dificuldade/revisões. As revisões começam com intervalos heurísticos simples; ainda não há um algoritmo adaptativo avançado nem diagnóstico completo por categorias de erro. O mapa de desempenho melhora à medida que atividades reais são concluídas.
+- O diagnóstico de desempenho usa os registros das atividades concluídas, com filtros por período, área, matéria e assunto/subassunto. As recomendações são heurísticas e exigem ao menos três respostas no assunto; as categorias associadas à questão são metadados, enquanto os motivos de erro são autodeclarados pelo estudante. As revisões continuam usando intervalos heurísticos, não um algoritmo adaptativo avançado.
 - O importador de ZIP usa recursos nativos do navegador (DecompressionStream para entradas compactadas), aceita ZIP32 sem senha e possui limites de tamanho/quantidade para reduzir riscos de arquivos excessivos. ZIP64 e arquivos criptografados não são aceitos. O JSON de questões tem limite de 100 MB; o ZIP tem limite de 512 MB, cada arquivo individual até 100 MB e 20.000 entradas. Navegadores antigos podem exigir ZIPs sem compressão ou atualização.
 - A interface mantém os registros textuais carregados em memória para alimentar filtros, painéis e relatórios; a lista visual é paginada, mas a consulta ainda não usa paginação por cursor diretamente no IndexedDB. Por isso, antes de importar acervos muito grandes (dezenas ou centenas de milhares de questões), é recomendável validar o desempenho no dispositivo e planejar uma otimização de consultas sob demanda. A importação já é dividida em lotes e a preparação do pacote usa Web Worker quando disponível.
 - Não há sincronização entre dispositivos, contas, servidor, IA interna, criptografia dos backups ou recuperação de senha: os arquivos de backup são o meio de transferência.
+
+## Histórico da atualização
+
+Consulte `CHANGELOG_v1.5.6.md` para as mudanças mais recentes e os changelogs anteriores para o histórico de versões.
 
 ## Estrutura do projeto
 
@@ -70,5 +70,111 @@ icons/icon-192.png
 icons/icon-512.png
 MODELO_PACOTE.json
 SCHEMA_PACOTE.md
+AUDITORIA_GRAFIA_QUESTIONS_v1.0.1.md
+CHANGELOG_v1.0.3.md
+CHANGELOG_v1.0.4.md
+CHANGELOG_v1.1.0.md
+CHANGELOG_v1.3.0.md
+CHANGELOG_v1.4.0.md
+CHANGELOG_v1.5.0.md
+CHANGELOG_v1.5.1.md
+CHANGELOG_v1.5.2.md
+CHANGELOG_v1.5.3.md
+CHANGELOG_v1.5.4.md
+CHANGELOG_v1.5.5.md
+CHANGELOG_v1.5.6.md
 README.md
 ```
+
+## Evolução das versões anteriores
+
+A versão 1.1.0 introduziu filtros combináveis por área/matéria, catálogo derivado das questões, seleção de trechos, marcação visual de alternativas e comentários individuais. Na versão 1.3.0, o seletor de assuntos foi ampliado com a lista de 100 tópicos do Grafia Study, a marcação de alternativas passou a funcionar por pressão longa e os grifos foram estendidos ao texto-base. A versão 1.4.0 mantém o seletor limitado aos 100 assuntos fixos e aos assuntos personalizados salvos manualmente. A versão 1.5.0 acrescenta histórico completo e gestão segura de pacotes, tarefas pendentes, seleção de questões de vários pacotes, desempenho com filtros combinados por período/área/matéria/assunto, análise por dificuldade, autodiagnóstico dos erros e recomendações de estudo. A versão 1.5.1 permite substituir duplicatas por uma versão importada menos completa, com histórico e restauração das versões anteriores. A versão 1.5.2 faz a exclusão de pacotes remover também todas as questões vinculadas e limpa questões órfãs deixadas por exclusões feitas em versões anteriores. A versão 1.5.3 permite pausar várias atividades, sair para criar novas tarefas e retomar cada uma com respostas e tempo preservados. A versão 1.5.4 permite limpar uma resposta tocando novamente na alternativa marcada, mantém a tipografia ao grifar e suaviza o rótulo “Comando”. A versão 1.5.5 permite inserir imagens na resolução geral e nos comentários individuais das alternativas, usando o mesmo JSON + ZIP. A versão 1.5.6 aplica a paleta Forest, amplia a tela de resolução em computadores, sincroniza a navegação lateral com a rolagem e registra a alternativa escolhida abaixo do número da questão.
+
+## Atualização 1.0.4
+
+- Os seis itens da navegação voltaram a exibir ícones vetoriais próprios.
+- O marcador flutuante separado da barra de navegação foi removido; a área ativa é sinalizada no próprio item.
+- O histórico registra os IDs das questões de cada pacote importado e oferece **Criar atividade** para resolver esse conjunto posteriormente.
+- A atividade usa os IDs já existentes no banco, sem importar ou duplicar questões novamente.
+- Registros antigos sem associação de IDs informam que é necessário reimportar o pacote para habilitar a ação.
+
+## Publicar em outra conta do GitHub
+
+Este ZIP é um pacote independente para um repositório novo. Extraia os arquivos diretamente para a raiz do novo repositório (onde ficará o `index.html`) e publique pelo GitHub Pages. Nenhum arquivo é enviado automaticamente para o repositório antigo.
+
+## Atualização 1.0.3
+
+- As fontes e referências da questão também aparecem separadas do enunciado na prévia do banco, durante a resolução e nos resultados.
+- A origem externa das imagens continua visível junto à imagem; ao mesclar uma questão já existente, os metadados de origem da imagem são preservados quando o novo pacote não os informa.
+- A limpeza do cache offline agora é limitada ao caminho desta instalação do Grafia Questions, sem apagar caches de outros aplicativos publicados sob o mesmo domínio.
+
+
+## Histórico de importações e atividades
+
+As importações feitas nesta versão guardam a relação de IDs das questões que vieram em cada pacote. Em **Configurações → Histórico → Criar atividade**, você pode transformar novamente aquele pacote em uma atividade de resolução, inclusive dias depois, sem importar as questões outra vez. O botão não aparece para registros antigos que não tenham essa relação salva; nesses casos, reimporte o mesmo pacote uma vez para habilitar a função. Só pode haver uma atividade em andamento por vez; uma sessão em andamento pode ser descartada no próprio painel de resolução.
+
+## Navegação 1.0.4
+
+A barra inferior voltou a exibir ícones próprios para as seis áreas. O indicador flutuante que aparecia separado da barra foi eliminado; o estado ativo é indicado dentro do próprio item.
+
+
+## v1.3.0
+
+- Seletor de assuntos usa a lista-base de 100 tópicos do Grafia Study, filtrada pelas matérias escolhidas, com busca e entrada personalizada.
+- Alternativas podem ser escurecidas por pressão longa de 1 segundo; não há mais botão de riscar nem texto tachado.
+- Comentário da alternativa selecionada aparece antes da resolução completa.
+- Grifos abrangem enunciado e texto-base e continuam salvos na atividade e no resultado.
+- A estimativa de proficiência usa MAP regularizado com parâmetros `a`, `b` e `c` calibrados. O diagnóstico separado de coerência por dificuldade não é uma nota TRI.
+
+
+## v1.4.0
+
+- O catálogo do seletor de atividades passa a exibir exclusivamente os 100 assuntos fixos do Grafia Study e assuntos personalizados que o usuário salvou manualmente.
+- Questões importadas deixam de cadastrar ou acrescentar assuntos ao catálogo.
+- A busca permite salvar uma expressão nova como assunto personalizado, mantendo-a no armazenamento local e nos backups.
+- Registros antigos gerados automaticamente a partir das questões são removidos na primeira atualização, sem apagar questões, respostas ou atividades.
+
+
+## v1.5.0
+
+- Banco: a aba **Pacotes e histórico** agrupa registros pelo identificador do pacote, permite busca, filtro e ordenação e mostra questões vinculadas, datas, arquivos e compartilhamento entre pacotes.
+- Histórico: cada pacote pode ter seus registros de histórico removidos sem apagar questões; a exclusão do pacote mostra uma confirmação com contagens e remove somente questões sem outros vínculos.
+- Integridade: questões referenciadas por outro pacote, coleção, atividade, resposta, revisão ou anotação são preservadas; imagens, blobs e textos-base só são eliminados quando não há questões remanescentes que os utilizem.
+- Tarefas: pacotes podem ser transformados em tarefas pendentes, resolvidos imediatamente ou combinados com outros pacotes. O gerador permite filtros por área, matéria, assunto/subassunto e dificuldade, seleção de todas, sorteio por quantidade ou seleção manual paginada, além de ordem embaralhada.
+- Atividades: tarefas pendentes podem ser iniciadas ou excluídas sem remover as questões do banco. As tarefas usam o armazenamento de atividades já existente e entram nos backups.
+- Desempenho: filtros de 7, 30, 90 dias ou todo o histórico; comparação com o período anterior; precisão nas respondidas separada do aproveitamento total; contagem de acertos, erros, questões em branco, questões únicas, atividades, tempo e revisões.
+- Diagnóstico: análises por área, matéria e todos os assuntos/subassuntos informados nas questões; evolução visual; histórico de atividades com acesso ao resultado detalhado; aviso sobre amostras pequenas; motivos de erro autodeclarados; recomendações que criam tarefas.
+- Relatório: botão para imprimir ou salvar o painel de desempenho como PDF pelo diálogo de impressão do navegador.
+- Compatibilidade: não há alteração de estrutura do IndexedDB. A versão 1.5.0 atualiza o identificador do aplicativo e o cache do Service Worker, preservando os bancos locais e backups anteriores.
+- A estimativa inspirada na TRI continua experimental e só usa itens com parâmetros calibrados; não representa uma nota oficial.
+
+
+## v1.5.1
+
+- A detecção de duplicatas agora reconhece questões com enunciado e alternativas idênticos mesmo quando os IDs das imagens ou do texto-base diferem. Correspondências somente pelo conteúdo exigem escolha manual.
+- Cada duplicata pode ser enriquecida, mantida como está ou substituída integralmente pela versão importada, independentemente da quantidade de informações.
+- A prévia compara a quantidade de informações da versão atual e da importada, destacando quando a importada contém menos dados e oferecendo uma ação em lote para marcar essas substituições; cada questão ainda pode ser ajustada individualmente.
+- A substituição mantém o ID original da questão, a data de criação, favoritos e histórico de respostas, além de preservar até cinco versões anteriores.
+- A tela de detalhes da questão permite restaurar uma das versões anteriores; a versão que estava ativa também é arquivada.
+- Não há alteração estrutural no IndexedDB. A atualização preserva os bancos locais e backups da versão 1.5.0. O cache offline foi atualizado para 1.5.1.
+
+
+## v1.5.2
+
+- Excluir um pacote agora remove todas as questões vinculadas a ele, mesmo quando também aparecem em outros pacotes, coleções ou favoritos. Referências de tarefas pendentes, atividades em andamento, revisões, coleções e outros registros de importação são atualizadas para não deixar vínculos quebrados.
+- A ação de histórico passou a ser explícita: **Excluir pacote e questões**. Não existe mais uma opção de apagar apenas o histórico e deixar as questões importadas soltas no banco.
+- Na primeira abertura, o Grafia consulta o diário local de alterações para identificar pacotes apagados em versões anteriores e remover as questões órfãs que ficaram para trás.
+- Atividades concluídas e resultados anteriores são preservados. A exclusão de um pacote não apaga o histórico de desempenho já concluído.
+- Não há alteração estrutural no IndexedDB. O cache offline foi atualizado para 1.5.2.
+
+
+## v1.5.3
+
+- Atividades em execução podem ser pausadas por **Salvar e sair**, voltando à tela de criação.
+- A área **Atividades salvas** lista tarefas pausadas, mostra o progresso e permite continuar ou excluir cada uma.
+- É possível acumular várias atividades pausadas e criar novas sem substituir as anteriores.
+- O cronômetro acumula apenas o tempo de execução e mantém o tempo restante quando a atividade é pausada.
+- As respostas, grifos, marcações de revisão e alternativas eliminadas continuam vinculadas à atividade salva.
+- A exclusão de questões de um pacote agora também atualiza atividades pausadas.
+- Nenhuma mudança estrutural no IndexedDB; a nova versão preserva os dados locais existentes. O cache offline foi atualizado para 1.5.3.
+
